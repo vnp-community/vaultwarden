@@ -1,0 +1,341 @@
+{
+	"info": {
+		"_postman_id": "vaultwarden-collection-v1",
+		"name": "Vaultwarden API",
+		"description": "Collection for testing Vaultwarden API endpoints.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"item": [
+		{
+			"name": "Identity",
+			"item": [
+				{
+					"name": "Prelogin",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "raw",
+							"raw": "{ \"email\": \"{{username}}\" }",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{base_url}}/identity/accounts/prelogin",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"identity",
+								"accounts",
+								"prelogin"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Login",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"var jsonData = pm.response.json();",
+									"pm.environment.set(\"access_token\", jsonData.access_token);",
+									"pm.environment.set(\"refresh_token\", jsonData.refresh_token);"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "urlencoded",
+							"urlencoded": [
+								{
+									"key": "grant_type",
+									"value": "password",
+									"type": "text"
+								},
+								{
+									"key": "username",
+									"value": "{{username}}",
+									"type": "text"
+								},
+								{
+									"key": "password",
+									"value": "{{password_hash}}",
+									"type": "text"
+								},
+								{
+									"key": "scope",
+									"value": "api offline_access",
+									"type": "text"
+								},
+								{
+									"key": "client_id",
+									"value": "web",
+									"type": "text"
+								},
+								{
+									"key": "device_identifier",
+									"value": "{{device_uuid}}",
+									"type": "text"
+								},
+								{
+									"key": "device_name",
+									"value": "Postman",
+									"type": "text"
+								},
+								{
+									"key": "device_type",
+									"value": "2",
+									"type": "text"
+								}
+							]
+						},
+						"url": {
+							"raw": "{{base_url}}/identity/connect/token",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"identity",
+								"connect",
+								"token"
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Core",
+			"item": [
+				{
+					"name": "Sync",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/sync",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"api",
+								"sync"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Profile",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/accounts/profile",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"api",
+								"accounts",
+								"profile"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "List Ciphers",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/ciphers",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"api",
+								"ciphers"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Create Cipher",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"type\": 1,\n    \"name\": \"Test Login\",\n    \"login\": {\n        \"username\": \"testuser\",\n        \"password\": \"password123\"\n    }\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{base_url}}/api/ciphers",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"api",
+								"ciphers"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "List Folders",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/folders",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"api",
+								"folders"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "List Collections",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/collections",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"api",
+								"collections"
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Public",
+			"item": [
+				{
+					"name": "Config",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/config",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"api",
+								"config"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Version",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/version",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"api",
+								"version"
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		}
+	],
+	"auth": {
+		"type": "bearer",
+		"bearer": [
+			{
+				"key": "token",
+				"value": "{{access_token}}",
+				"type": "string"
+			}
+		]
+	},
+	"event": [
+		{
+			"listen": "prerequest",
+			"script": {
+				"type": "text/javascript",
+				"exec": [
+					""
+				]
+			}
+		},
+		{
+			"listen": "test",
+			"script": {
+				"type": "text/javascript",
+				"exec": [
+					""
+				]
+			}
+		}
+	],
+	"variable": [
+		{
+			"key": "base_url",
+			"value": "http://localhost:8000",
+			"type": "string"
+		},
+		{
+			"key": "username",
+			"value": "user@example.com",
+			"type": "string"
+		},
+		{
+			"key": "password_hash",
+			"value": "",
+			"type": "string"
+		},
+		{
+			"key": "device_uuid",
+			"value": "d63426e2-28df-468f-a9cb-56064f777651",
+			"type": "string"
+		},
+		{
+			"key": "access_token",
+			"value": "",
+			"type": "string"
+		}
+	]
+}
