@@ -158,4 +158,6 @@ GET  /api/audit/export?format=csv|json&from=&to=
 
 ---
 
-*Status: Draft | Author: Product Team | Date: 2026-04-12*
+*Status: ✅ Implemented | Author: Product Team | Date: 2026-04-12 | Cập nhật: 2026-04-17*
+
+> **Implementation**: [SOL-002](solutions/SOL-002-audit-log-siem.md) — `src/audit.rs` (137L), `src/siem.rs` (100L), `src/api/core/audit.rs`, DB migration `2026-04-15-000003_sol_002_audit`, tests `audit_tests.rs` (366L)

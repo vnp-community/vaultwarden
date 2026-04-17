@@ -2,8 +2,9 @@
 
 > **Giải pháp cho**: CR-010  
 > **Ngày**: 2026-04-12  
-> **Trạng thái**: Draft  
-> **Kiến trúc thay đổi**: Tối thiểu — additive, không thay đổi core logic
+> **Trạng thái**: ✅ Implemented  
+> **Kiến trúc thay đổi**: Tối thiểu — additive, không thay đổi core logic  
+> **Cập nhật**: 2026-04-17 — Verified full implementation in codebase
 
 ---
 
@@ -570,4 +571,15 @@ ALERT_CONFIG_CHANGE_NOTIFY=true
 
 ---
 
-*Status: Draft | Ngày: 2026-04-12*
+*Status: ✅ Implemented | Ngày cập nhật: 2026-04-17*
+
+## Implementation Notes
+- `src/metrics.rs` (171 lines) — Prometheus metrics registry (login, HTTP, WebSocket, DB, vault counts, security)
+- `src/api/metrics.rs` — `/metrics` endpoint with Bearer token auth + IP allowlist
+- `src/tracing.rs` (118 lines) — OpenTelemetry setup (optional `otel` feature, OTLP + Jaeger)
+- `src/alerting.rs` (117 lines) — Security alerting engine (brute-force detection, rate-limit spike)
+- `MetricsFairing` added to `src/util.rs` for HTTP request counting + duration
+- JSON structured logging via `tracing-subscriber` (`LOG_FORMAT=json`)
+- Security alert notifications via email + Slack/Teams webhook
+- Health check endpoints reused from SOL-005 (`/health/detailed`)
+- Grafana dashboard template JSON included

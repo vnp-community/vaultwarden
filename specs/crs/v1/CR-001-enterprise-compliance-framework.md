@@ -87,4 +87,6 @@ PII_ENCRYPTION_KEY_ID=<KMS key ARN>   # Separate key for PII fields
 
 ---
 
-*Status: Draft | Author: Product Team | Date: 2026-04-12*
+*Status: ✅ Implemented | Author: Product Team | Date: 2026-04-12 | Cập nhật: 2026-04-17*
+
+> **Implementation**: [SOL-001](solutions/SOL-001-enterprise-compliance-framework.md) — `src/api/core/compliance.rs` (414L), `src/compliance/`, DB migration `2026-04-15-000002_gdpr_compliance`, tests `compliance_tests.rs` (209L)

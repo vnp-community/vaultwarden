@@ -183,4 +183,6 @@ GET /api/admin/devices
 
 ---
 
-*Status: Draft | Author: Product Team | Date: 2026-04-12*
+*Status: ✅ Implemented | Author: Product Team | Date: 2026-04-12 | Cập nhật: 2026-04-17*
+
+> **Implementation**: [SOL-009](solutions/SOL-009-mdm-cert-auth.md) — `src/device_trust.rs` (220L), `src/mdm/intune.rs` (101L), `src/mdm/jamf.rs` (93L), DB migration `2026-04-15-000009_sol_009_mdm`

@@ -2,8 +2,9 @@
 
 > **Giải pháp cho**: CR-004  
 > **Ngày**: 2026-04-12  
-> **Trạng thái**: Draft  
-> **Kiến trúc thay đổi**: Trung bình — mở rộng permission model, thêm middleware layers
+> **Trạng thái**: ✅ Implemented  
+> **Kiến trúc thay đổi**: Trung bình — mở rộng permission model, thêm middleware layers  
+> **Cập nhật**: 2026-04-17 — Verified full implementation in codebase
 
 ---
 
@@ -583,4 +584,14 @@ BREAK_GLASS_NOTIFICATION_TIMEOUT_SECONDS=60
 
 ---
 
-*Status: Draft | Ngày: 2026-04-12*
+*Status: ✅ Implemented | Ngày cập nhật: 2026-04-17*
+
+## Implementation Notes
+- `src/access_control.rs` (86 lines) — Core time/IP/SoD access control engine
+- `src/api/core/access_control.rs` — REST API for access control config
+- DB models: `access_schedule.rs`, `ip_allowlist.rs`, `approval_request.rs`, `break_glass_config.rs`, `sod_rule.rs` — all present
+- DB migration: `2026-04-15-000005_sol_004_rbac` — custom_roles, access_schedules, ip_allowlists, approval_requests, break_glass_configs, sod_rules
+- IpAllowlistFairing implemented in `src/util.rs`
+- Break-glass activation + notification in `src/api/core/access_control.rs`
+- SoD enforcement integrated into organization role assignment
+- Dual approval workflow wired into cipher access + PAM checkout

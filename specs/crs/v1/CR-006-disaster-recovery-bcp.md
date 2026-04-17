@@ -197,4 +197,6 @@ Mỗi backup kèm theo:
 
 ---
 
-*Status: Draft | Author: Product Team | Date: 2026-04-12*
+*Status: ✅ Implemented | Author: Product Team | Date: 2026-04-12 | Cập nhật: 2026-04-17*
+
+> **Implementation**: [SOL-006](solutions/SOL-006-disaster-recovery.md) — `src/backup.rs` (275L), `src/api/admin/backup.rs`, `src/db/models/backup_run.rs`, DB migration `2026-04-15-000006_sol_006_backup`, tests `backup_tests.rs` (67L)

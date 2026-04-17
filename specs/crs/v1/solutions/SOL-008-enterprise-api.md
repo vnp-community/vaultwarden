@@ -2,8 +2,9 @@
 
 > **Giải pháp cho**: CR-008  
 > **Ngày**: 2026-04-12  
-> **Trạng thái**: Draft  
-> **Kiến trúc thay đổi**: Tối thiểu — mở rộng API key model, thêm webhook system
+> **Trạng thái**: ✅ Implemented  
+> **Kiến trúc thay đổi**: Tối thiểu — mở rộng API key model, thêm webhook system  
+> **Cập nhật**: 2026-04-17 — Verified full implementation in codebase
 
 ---
 
@@ -544,4 +545,15 @@ API_KEY_ROTATION_REMINDER_DAYS=30   # Email reminder before expiry
 
 ---
 
-*Status: Draft | Ngày: 2026-04-12*
+*Status: ✅ Implemented | Ngày cập nhật: 2026-04-17*
+
+## Implementation Notes
+- `src/api/core/api_keys.rs` (349 lines) — Full CRUD + rotation + analytics for API keys
+- `src/api/core/webhooks.rs` (260 lines) — Webhook CRUD + test delivery + delivery log
+- `src/api/core/secrets.rs` — Secrets API (list, get, export) with `SecretsRead` scope
+- `src/webhook_delivery.rs` (197 lines) — HMAC-SHA256 signed delivery with exponential backoff
+- DB migration: `2026-04-15-000008_sol_008_apikeys` — api_keys_v2, api_key_usage, webhooks, webhook_deliveries
+- `ciphers.is_secret` + `ciphers.secret_project` fields added
+- Tests: `tests/api_management_tests.rs` (368 lines) — scope enforcement, HMAC signing, analytics
+- `ApiKeyAuth` guard with IP allowlist + per-key rate limiting in `src/auth.rs`
+- Webhook events dispatched from cipher CRUD operations

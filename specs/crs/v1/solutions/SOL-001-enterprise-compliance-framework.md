@@ -2,8 +2,9 @@
 
 > **Giải pháp cho**: CR-001  
 > **Ngày**: 2026-04-12  
-> **Trạng thái**: Draft  
-> **Kiến trúc thay đổi**: Tối thiểu — additive changes only
+> **Trạng thái**: ✅ Implemented  
+> **Kiến trúc thay đổi**: Tối thiểu — additive changes only  
+> **Cập nhật**: 2026-04-17 — Verified full implementation in codebase
 
 ---
 
@@ -412,4 +413,13 @@ SECURITY_TXT_EXPIRES=""             # RFC3339 datetime
 
 ---
 
-*Status: Draft | Ngày: 2026-04-12*
+*Status: ✅ Implemented | Ngày cập nhật: 2026-04-17*
+
+## Implementation Notes
+- `src/api/core/compliance.rs` (414 lines) — Compliance Evidence API routes fully implemented
+- `src/db/models/erasure_log.rs` — GDPR erasure audit records
+- `src/compliance/` — Evidence collector, report generator
+- DB migration: `2026-04-15-000002_gdpr_compliance` — erasure_logs, data_processing_register tables
+- Tests: `tests/compliance_tests.rs` (209 lines)
+- SecurityHeadersFairing implemented in `src/util.rs`
+- `.well-known/security.txt` endpoint live

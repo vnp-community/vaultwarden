@@ -2,8 +2,9 @@
 
 > **Giải pháp cho**: CR-006  
 > **Ngày**: 2026-04-12  
-> **Trạng thái**: Draft  
-> **Kiến trúc thay đổi**: Tối thiểu — thêm backup subsystem, không thay đổi core
+> **Trạng thái**: ✅ Implemented  
+> **Kiến trúc thay đổi**: Tối thiểu — thêm backup subsystem, không thay đổi core  
+> **Cập nhật**: 2026-04-17 — Verified full implementation in codebase
 
 ---
 
@@ -503,4 +504,14 @@ BACKUP_SECONDARY_REGION=""
 
 ---
 
-*Status: Draft | Ngày: 2026-04-12*
+*Status: ✅ Implemented | Ngày cập nhật: 2026-04-17*
+
+## Implementation Notes
+- `src/backup.rs` (275 lines) — BackupManager: pg_dump, SQLite copy, S3 upload via OpenDAL, manifest + SHA-256
+- `src/api/admin/backup.rs` — Admin API: trigger, verify, status, DR runbook endpoints
+- `src/db/models/backup_run.rs` — BackupRun model
+- DB migration: `2026-04-15-000006_sol_006_backup` — backup_runs table with verification tracking
+- Tests: `tests/backup_tests.rs` (67 lines)
+- Automated verification job: pg_restore to ephemeral schema, record count check
+- Alert email on backup failure / verification failure
+- Backup + verification cron jobs registered in `src/main.rs`

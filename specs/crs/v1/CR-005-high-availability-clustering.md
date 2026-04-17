@@ -182,4 +182,6 @@ CLUSTER_MODE=false                     # Enable cluster mode (requires Redis)
 
 ---
 
-*Status: Draft | Author: Product Team | Date: 2026-04-12*
+*Status: ✅ Implemented | Author: Product Team | Date: 2026-04-12 | Cập nhật: 2026-04-17*
+
+> **Implementation**: [SOL-005](solutions/SOL-005-high-availability.md) — `src/cache.rs` (152L), `src/api/health.rs` (63L), `READ_POOL` read replica, Redis pubsub listener, SIGTERM graceful shutdown

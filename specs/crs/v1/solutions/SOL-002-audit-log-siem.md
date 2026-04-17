@@ -2,8 +2,9 @@
 
 > **Giải pháp cho**: CR-002  
 > **Ngày**: 2026-04-12  
-> **Trạng thái**: Draft  
-> **Kiến trúc thay đổi**: Trung bình — thêm audit subsystem mới, không thay đổi core API
+> **Trạng thái**: ✅ Implemented  
+> **Kiến trúc thay đổi**: Trung bình — thêm audit subsystem mới, không thay đổi core API  
+> **Cập nhật**: 2026-04-17 — Verified full implementation in codebase
 
 ---
 
@@ -537,4 +538,13 @@ AUDIT_CHANNEL_BUFFER_SIZE=10000     # Buffer cho async channel
 
 ---
 
-*Status: Draft | Ngày: 2026-04-12*
+*Status: ✅ Implemented | Ngày cập nhật: 2026-04-17*
+
+## Implementation Notes
+- `src/audit.rs` (137 lines) — AuditEmitter + hash chain logic implemented
+- `src/siem.rs` (100 lines) — SIEM forwarder (Splunk HEC, Syslog RFC5424, JSON Lines, Microsoft Sentinel)
+- `src/api/core/audit.rs` — Audit query REST API
+- `src/db/models/audit.rs` — Audit entry DB model
+- DB migration: `2026-04-15-000003_sol_002_audit` — audit_entries + audit_entries_archive, append-only RLS
+- Tests: `tests/audit_tests.rs` (366 lines)
+- Integrated into identity.rs, admin.rs, accounts.rs, ciphers.rs

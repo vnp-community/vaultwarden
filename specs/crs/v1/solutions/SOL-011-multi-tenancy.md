@@ -2,8 +2,9 @@
 
 > **Giải pháp cho**: CR-011  
 > **Ngày**: 2026-04-12  
-> **Trạng thái**: Draft  
-> **Kiến trúc thay đổi**: Đáng kể — thay đổi data model cơ bản, migration strategy quan trọng
+> **Trạng thái**: ✅ Implemented  
+> **Kiến trúc thay đổi**: Đáng kể — thay đổi data model cơ bản, migration strategy quan trọng  
+> **Cập nhật**: 2026-04-17 — Verified full implementation in codebase
 
 ---
 
@@ -490,4 +491,15 @@ TENANT_RLS_ENABLED=false             # Enable PostgreSQL RLS (requires PostgreSQ
 
 ---
 
-*Status: Draft | Ngày: 2026-04-12*
+*Status: ✅ Implemented | Ngày cập nhật: 2026-04-17*
+
+## Implementation Notes
+- `src/tenant.rs` (225 lines) — TenantContext request guard, subdomain/path/domain routing, slug cache
+- `src/api/system/tenants.rs` (189 lines) — Full System Admin CRUD API for tenants
+- `src/db/models/tenant.rs` — Tenant + TenantAdmin data models
+- DB migration: `2026-04-15-000010_sol_011_multitenancy` — tenants, tenant_admins tables; tenant_uuid columns on users/organizations/audit_entries
+- DB migration: `2026-04-15-000011_sol_011_rls` — PostgreSQL Row-Level Security policies
+- DEFAULT tenant (UUID `00000000-0000-0000-0000-000000000001`) auto-assigned to all existing data
+- `find_by_email_ctx()` / `_ctx` pattern for backward-compat tenant-scoped queries
+- JWT claims extended with `tenant_uuid`, `is_tenant_admin`, `is_system_admin`
+- Tests: `tests/multitenancy_tests.rs` (474 lines) — isolation, cross-tenant access, routing

@@ -249,4 +249,6 @@ Official Grafana dashboard (JSON) shipped with Vaultwarden:
 
 ---
 
-*Status: Draft | Author: Product Team | Date: 2026-04-12*
+*Status: ✅ Implemented | Author: Product Team | Date: 2026-04-12 | Cập nhật: 2026-04-17*
+
+> **Implementation**: [SOL-010](solutions/SOL-010-observability.md) — `src/metrics.rs` (171L), `src/alerting.rs` (117L), `src/tracing.rs` (118L), `src/api/metrics.rs` (`/metrics` Prometheus endpoint)

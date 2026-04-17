@@ -162,4 +162,6 @@ Review audit entry logged
 
 ---
 
-*Status: Draft | Author: Product Team | Date: 2026-04-12*
+*Status: ✅ Implemented | Author: Product Team | Date: 2026-04-12 | Cập nhật: 2026-04-17*
+
+> **Implementation**: [SOL-003](solutions/SOL-003-ldap-scim.md) — `src/ldap.rs` (319L), `src/api/scim/mod.rs` (427L), DB migration `2026-04-15-000004_sol_003_ldap`

@@ -215,4 +215,6 @@ Example SoD rules:
 
 ---
 
-*Status: Draft | Author: Product Team | Date: 2026-04-12*
+*Status: ✅ Implemented | Author: Product Team | Date: 2026-04-12 | Cập nhật: 2026-04-17*
+
+> **Implementation**: [SOL-004](solutions/SOL-004-granular-rbac.md) — `src/access_control.rs` (86L), models: `break_glass_config`, `sod_rule`, `ip_allowlist`, `access_schedule`, `approval_request`, DB migration `2026-04-15-000005_sol_004_rbac`

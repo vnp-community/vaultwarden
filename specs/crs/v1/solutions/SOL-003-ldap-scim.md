@@ -2,8 +2,9 @@
 
 > **Giải pháp cho**: CR-003  
 > **Ngày**: 2026-04-12  
-> **Trạng thái**: Draft  
-> **Kiến trúc thay đổi**: Trung bình — thêm LDAP connector + SCIM API module mới
+> **Trạng thái**: ✅ Implemented  
+> **Kiến trúc thay đổi**: Trung bình — thêm LDAP connector + SCIM API module mới  
+> **Cập nhật**: 2026-04-17 — Verified full implementation in codebase
 
 ---
 
@@ -611,4 +612,13 @@ rocket.mount("/scim", scim::routes())
 
 ---
 
-*Status: Draft | Ngày: 2026-04-12*
+*Status: ✅ Implemented | Ngày cập nhật: 2026-04-17*
+
+## Implementation Notes
+- `src/ldap.rs` (319 lines) — LDAP connector, sync logic, user/group mapping fully implemented
+- `src/api/scim/mod.rs` (427 lines) — Full SCIM 2.0 endpoints (Users, Groups, ServiceProviderConfig)
+- `src/db/models/ldap_sync.rs`, `src/db/models/access_review.rs` — tracking models
+- DB migration: `2026-04-15-000004_sol_003_ldap` — ldap_sync_state, ldap_group_mappings, access_reviews, scim_tokens
+- JIT provisioning enhancement in `src/sso.rs`
+- Access review workflow with background jobs
+- SCIM bearer token middleware

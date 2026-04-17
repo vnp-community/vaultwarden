@@ -2,8 +2,9 @@
 
 > **Giải pháp cho**: CR-005  
 > **Ngày**: 2026-04-12  
-> **Trạng thái**: Draft  
-> **Kiến trúc thay đổi**: Đáng kể — thêm Redis layer, refactor in-memory state
+> **Trạng thái**: ✅ Implemented  
+> **Kiến trúc thay đổi**: Đáng kể — thêm Redis layer, refactor in-memory state  
+> **Cập nhật**: 2026-04-17 — Verified full implementation in codebase
 
 ---
 
@@ -495,4 +496,15 @@ SHUTDOWN_TIMEOUT_SECONDS=30
 
 ---
 
-*Status: Draft | Ngày: 2026-04-12*
+*Status: ✅ Implemented | Ngày cập nhật: 2026-04-17*
+
+## Implementation Notes
+- `src/cache.rs` (152 lines) — `CacheBackend` trait + InMemoryCache + RedisCache implementations
+- `src/api/health.rs` (63 lines) — `/health`, `/health/ready`, `/health/live`, `/health/detailed` endpoints
+- `src/db/mod.rs` — `READ_POOL` + read replica connection pool (TASK-005-015)
+- Rate limiter migrated to cache-backed counter in `src/ratelimit.rs`
+- OIDC cache migrated to `CacheBackend` in `src/sso.rs`
+- WebSocket Redis Pub/Sub listener: `start_redis_pubsub_listener()` in `src/api/notifications.rs` (line 759)
+- Graceful SIGTERM shutdown in `src/main.rs` (lines 703-745)
+- Redis feature flag: `deadpool-redis`, `redis` optional crates in `Cargo.toml`
+- Config: `REDIS_ENABLED`, `CLUSTER_MODE`, `DATABASE_READ_URL` — all implemented

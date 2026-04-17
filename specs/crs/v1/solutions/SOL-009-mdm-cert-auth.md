@@ -2,8 +2,9 @@
 
 > **Giải pháp cho**: CR-009  
 > **Ngày**: 2026-04-12  
-> **Trạng thái**: Draft  
-> **Kiến trúc thay đổi**: Trung bình — thêm TLS client cert validation, MDM API integrations
+> **Trạng thái**: ✅ Implemented  
+> **Kiến trúc thay đổi**: Trung bình — thêm TLS client cert validation, MDM API integrations  
+> **Cập nhật**: 2026-04-17 — Verified full implementation in codebase
 
 ---
 
@@ -529,4 +530,14 @@ DEVICE_TRUST_ENABLED=false
 
 ---
 
-*Status: Draft | Ngày: 2026-04-12*
+*Status: ✅ Implemented | Ngày cập nhật: 2026-04-17*
+
+## Implementation Notes
+- `src/device_trust.rs` (220 lines) — DeviceCertInfo extraction + trust evaluation engine
+- `src/mdm/mod.rs`, `src/mdm/intune.rs` (101 lines), `src/mdm/jamf.rs` (93 lines) — MDM provider abstraction + Graph API client
+- `src/api/admin/devices.rs` — Device inventory, compliance view, remote wipe
+- DB migration: `2026-04-15-000009_sol_009_mdm` — device trust fields on devices table, device_trust_policies, mdm_compliance_cache
+- Intune access token caching with refresh flow
+- MDM compliance caching (TTL configurable via `INTUNE_COMPLIANCE_CACHE_SECONDS`)
+- Login flow integration: device trust evaluated after auth, before JWT issuance
+- Remote wipe via push notification + security stamp revocation

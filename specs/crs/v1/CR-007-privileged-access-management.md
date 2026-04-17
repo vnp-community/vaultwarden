@@ -205,4 +205,6 @@ GET /api/admin/pam/dashboard
 
 ---
 
-*Status: Draft | Author: Product Team | Date: 2026-04-12*
+*Status: ✅ Implemented | Author: Product Team | Date: 2026-04-12 | Cập nhật: 2026-04-17*
+
+> **Implementation**: [SOL-007](solutions/SOL-007-pam.md) — `src/pam/` (checkout 99L, rotation 114L, itsm), `src/api/core/pam.rs`, DB migration `2026-04-15-000007_sol_007_pam` (privileged_configs, checkouts, rotation_history)
