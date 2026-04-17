@@ -45,6 +45,8 @@ pub struct User {
     pub private_key: Option<String>,
     pub public_key: Option<String>,
 
+    pub tenant_uuid: String,
+
     #[diesel(column_name = "totp_secret")] // Note, this is only added to the UserDb structs, not to User
     _totp_secret: Option<String>,
     pub totp_recover: Option<String>,
@@ -65,6 +67,13 @@ pub struct User {
     pub avatar_color: Option<String>,
 
     pub external_id: Option<String>, // Todo: Needs to be removed in the future, this is not used anymore.
+
+    // TASK-001-005: GDPR erasure scheduling (SOL-001)
+    pub pii_erasure_scheduled_at: Option<NaiveDateTime>,
+    pub pii_erased_at: Option<NaiveDateTime>,
+    pub provisioning_source: Option<String>,
+    pub provisioning_external_id: Option<String>,
+    pub suspension_scheduled_at: Option<NaiveDateTime>,
 }
 
 #[derive(Identifiable, Queryable, Insertable)]
@@ -134,6 +143,8 @@ impl User {
             private_key: None,
             public_key: None,
 
+            tenant_uuid: CONFIG.tenant_default_uuid(),
+
             _totp_secret: None,
             totp_recover: None,
 
@@ -150,6 +161,12 @@ impl User {
             avatar_color: None,
 
             external_id: None, // Todo: Needs to be removed in the future, this is not used anymore.
+
+            pii_erasure_scheduled_at: None,
+            pii_erased_at: None,
+            provisioning_source: None,
+            provisioning_external_id: None,
+            suspension_scheduled_at: None,
         }
     }
 
@@ -402,6 +419,121 @@ impl User {
         match Device::find_latest_active_by_user(&self.uuid, conn).await {
             Some(device) => Some(device.updated_at),
             None => None,
+        }
+    }
+
+    // TASK-001-010: Compliance evidence counters
+    pub async fn count_all(conn: &DbConn) -> i64 {
+        db_run! { conn: {
+            users::table
+                .count()
+                .get_result::<i64>(conn)
+                .unwrap_or(0)
+        }}
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // TASK-011-007: Tenant-aware (_ctx) query variants — SOL-011 Multi-Tenancy
+    // These wrap existing queries to add an optional tenant_uuid filter.
+    // When ctx is SingleInstance the behaviour is identical to the original methods.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Find a user by email, scoped to the current tenant context.
+    pub async fn find_by_mail_ctx(
+        mail: &str,
+        ctx: &crate::tenant::TenantContext,
+        conn: &DbConn,
+    ) -> Option<Self> {
+        use crate::tenant::TenantContext;
+        let lower_mail = mail.to_lowercase();
+        match ctx {
+            TenantContext::SingleInstance => {
+                // No tenant filter — backward-compatible
+                db_run! { conn: {
+                    users::table
+                        .filter(users::email.eq(lower_mail))
+                        .first::<Self>(conn)
+                        .ok()
+                }}
+            }
+            TenantContext::SystemAdmin => {
+                // System admin: cross-tenant lookup by email only
+                db_run! { conn: {
+                    users::table
+                        .filter(users::email.eq(lower_mail))
+                        .first::<Self>(conn)
+                        .ok()
+                }}
+            }
+            TenantContext::Tenant(tenant_uuid) => {
+                let tid = tenant_uuid.clone();
+                db_run! { conn: {
+                    users::table
+                        .filter(users::email.eq(lower_mail))
+                        .filter(users::tenant_uuid.eq(tid))
+                        .first::<Self>(conn)
+                        .ok()
+                }}
+            }
+        }
+    }
+
+    /// Count all users scoped to the current tenant context.
+    pub async fn count_all_ctx(ctx: &crate::tenant::TenantContext, conn: &DbConn) -> i64 {
+        use crate::tenant::TenantContext;
+        match ctx {
+            TenantContext::SingleInstance | TenantContext::SystemAdmin => {
+                db_run! { conn: {
+                    users::table
+                        .count()
+                        .get_result::<i64>(conn)
+                        .unwrap_or(0)
+                }}
+            }
+            TenantContext::Tenant(tenant_uuid) => {
+                let tid = tenant_uuid.clone();
+                db_run! { conn: {
+                    users::table
+                        .filter(users::tenant_uuid.eq(tid))
+                        .count()
+                        .get_result::<i64>(conn)
+                        .unwrap_or(0)
+                }}
+            }
+        }
+    }
+
+    /// Get all users scoped to the current tenant context.
+    pub async fn get_all_ctx(
+        ctx: &crate::tenant::TenantContext,
+        conn: &DbConn,
+    ) -> Vec<(Self, Option<SsoUser>)> {
+        use crate::tenant::TenantContext;
+        match ctx {
+            TenantContext::SingleInstance | TenantContext::SystemAdmin => {
+                db_run! { conn: {
+                    users::table
+                        .left_join(sso_users::table)
+                        .select(<(Self, Option<SsoUser>)>::as_select())
+                        .load(conn)
+                        .expect("Error loading all users")
+                        .into_iter()
+                        .collect()
+                }}
+            }
+            TenantContext::Tenant(tenant_uuid) => {
+                let tid = tenant_uuid.clone();
+                db_run! { conn: {
+                    users::table
+                        .left_join(sso_users::table)
+                        .select(<(Self, Option<SsoUser>)>::as_select())
+                        .filter(users::tenant_uuid.eq(tid))
+                        .load(conn)
+                        .expect("Error loading tenant users")
+                        .into_iter()
+                        .collect()
+                }}
+            }
         }
     }
 }

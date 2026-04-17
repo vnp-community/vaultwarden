@@ -4,6 +4,10 @@ mod icons;
 mod identity;
 mod notifications;
 mod push;
+pub mod metrics;
+pub mod health;
+pub mod scim;
+pub mod system;
 mod web;
 
 use rocket::serde::json::Json;
@@ -12,18 +16,26 @@ use serde_json::Value;
 pub use crate::api::{
     admin::catchers as admin_catchers,
     admin::routes as admin_routes,
+    admin::validate_admin_token,
+    admin::validate_disable_admin_token,
     core::catchers as core_catchers,
     core::purge_auth_requests,
     core::purge_sends,
     core::purge_trashed_ciphers,
     core::routes as core_routes,
+    core::compliance::routes as compliance_routes,
+    core::compliance::execute_scheduled_erasures,
     core::two_factor::send_incomplete_2fa_notifications,
     core::{emergency_notification_reminder_job, emergency_request_timeout_job},
     core::{event_cleanup_job, events_routes as core_events_routes},
     icons::routes as icons_routes,
     identity::routes as identity_routes,
     notifications::routes as notifications_routes,
-    notifications::{AnonymousNotify, Notify, UpdateType, WS_ANONYMOUS_SUBSCRIPTIONS, WS_USERS},
+    metrics::routes as metrics_routes,
+    scim::routes as scim_routes,
+    notifications::{AnonymousNotify, Notify, UpdateType, WS_ANONYMOUS_SUBSCRIPTIONS, WS_USERS, start_ws_cleanup_task},
+    health::routes as health_routes,
+    system::routes as system_routes,
     push::{
         push_cipher_update, push_folder_update, push_logout, push_send_update, push_user_update, register_push_device,
         unregister_push_device,
@@ -32,6 +44,9 @@ pub use crate::api::{
     web::routes as web_routes,
     web::static_files,
 };
+
+#[cfg(feature = "redis")]
+pub use crate::api::notifications::start_redis_pubsub_listener;
 use crate::db::{
     models::{OrgPolicy, OrgPolicyType, User},
     DbConn,

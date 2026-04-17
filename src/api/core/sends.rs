@@ -35,6 +35,14 @@ static ANON_PUSH_DEVICE: LazyLock<Device> = LazyLock::new(|| {
         push_token: None,
         refresh_token: String::new(),
         twofactor_remember: None,
+        is_trusted: false,
+        mdm_enrolled: false,
+        mdm_compliant: false,
+        mdm_last_check_at: None,
+        cert_subject: None,
+        cert_serial: None,
+        cert_expires_at: None,
+        cert_issuer: None,
     }
 });
 
@@ -570,7 +578,7 @@ async fn download_url(host: &Host, send_id: &SendId, file_id: &SendFileId) -> Re
 
     if operator.info().scheme() == <&'static str>::from(opendal::Scheme::Fs) {
         let token_claims = crate::auth::generate_send_claims(send_id, file_id);
-        let token = crate::auth::encode_jwt(&token_claims);
+        let token = crate::auth::encode_jwt(&token_claims)?;
 
         Ok(format!("{}/api/sends/{send_id}/{file_id}?t={token}", &host.host))
     } else {

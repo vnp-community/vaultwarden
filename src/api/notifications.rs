@@ -1,6 +1,6 @@
 use std::{
     net::IpAddr,
-    sync::{Arc, LazyLock},
+    sync::{atomic::{AtomicUsize, Ordering}, Arc, LazyLock},
     time::Duration,
 };
 
@@ -9,6 +9,7 @@ use rmpv::Value;
 use rocket::{futures::StreamExt, Route};
 use rocket_ws::{Message, WebSocket};
 use tokio::sync::mpsc::Sender;
+use serde::{Serialize, Deserialize};
 
 use crate::{
     auth::{ClientIp, WsAccessTokenHeader},
@@ -38,6 +39,40 @@ use super::{
 
 static NOTIFICATIONS_DISABLED: LazyLock<bool> = LazyLock::new(|| !CONFIG.enable_websocket() && !CONFIG.push_enabled());
 
+/// TASK-RUSTDEV-HIGH-02 — anonymous connection counter used to enforce the
+/// max-anonymous-websocket limit. Atomic so no lock is needed on the hot path.
+static WS_ANON_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// Maximum number of concurrent anonymous WS connections.
+/// TASK-SEC-LOW-02-B: Migrated from raw env var (WS_ANON_MAX_CONNECTIONS) to proper
+/// make_config! key `ws_anon_max_connections` (default 100). Operators can override
+/// via env var WS_ANON_MAX_CONNECTIONS or via the Vaultwarden admin UI.
+static WS_ANON_MAX: LazyLock<usize> = LazyLock::new(|| CONFIG.ws_anon_max_connections());
+
+/// TASK-RUSTDEV-HIGH-02 — starts a background task that periodically evicts
+/// stale / zombie entries from `WS_USERS` (entries with no active senders)
+/// to prevent unbounded DashMap growth.
+pub fn start_ws_cleanup_task() {
+    let users = Arc::clone(&WS_USERS);
+    let anon = Arc::clone(&WS_ANONYMOUS_SUBSCRIPTIONS);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            // Remove WS user entries that have no live senders
+            users.map.retain(|_uid, senders| {
+                senders.retain(|(_uuid, tx)| !tx.is_closed());
+                !senders.is_empty()
+            });
+            // Remove anonymous subscriptions where the sender is closed
+            anon.map.retain(|_token, tx| !tx.is_closed());
+            let user_count = users.map.len();
+            let anon_count = anon.map.len();
+            debug!("WS cleanup: {user_count} user sessions, {anon_count} anonymous subscriptions");
+        }
+    });
+}
+
 pub fn routes() -> Vec<Route> {
     if CONFIG.enable_websocket() {
         routes![websockets_hub, anonymous_websockets_hub]
@@ -47,10 +82,10 @@ pub fn routes() -> Vec<Route> {
     }
 }
 
-#[derive(FromForm, Debug)]
-struct WsAccessToken {
-    access_token: Option<String>,
-}
+// TASK-RUSTDEV-CRIT-02-A: WsAccessToken struct removed.
+// All Bitwarden clients send the JWT via Authorization: Bearer header since ~2023.
+// The query-param fallback (?access_token=...) was logged as deprecated (CRIT-02-B)
+// and is now hard-removed to prevent tokens appearing in server access logs.
 
 struct WSEntryMapGuard {
     users: Arc<WebSocketUsers>,
@@ -76,6 +111,8 @@ impl Drop for WSEntryMapGuard {
         if let Some(mut entry) = self.users.map.get_mut(self.user_uuid.as_ref()) {
             entry.retain(|(uuid, _)| uuid != &self.entry_uuid);
         }
+        // TASK-010-008: decrement authenticated WS connection gauge
+        crate::metrics::METRICS.websocket_connections.dec();
     }
 }
 
@@ -99,25 +136,28 @@ impl Drop for WSAnonymousEntryMapGuard {
     fn drop(&mut self) {
         info!("Closing WS connection from {}", self.addr);
         self.subscriptions.map.remove(&self.token);
+        // Decrement the active connection counter (TASK-RUSTDEV-HIGH-02)
+        WS_ANON_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+        // TASK-010-008: decrement anonymous WS connection gauge
+        crate::metrics::METRICS.websocket_connections.dec();
     }
 }
 
 #[allow(tail_expr_drop_order)]
-#[get("/hub?<data..>")]
+// TASK-RUSTDEV-CRIT-02-A: Accept JWT only via Authorization: Bearer header.
+// The legacy ?access_token=... query param fallback has been removed.
+#[get("/hub")]
 fn websockets_hub<'r>(
     ws: WebSocket,
-    data: WsAccessToken,
     ip: ClientIp,
     header_token: WsAccessTokenHeader,
 ) -> Result<rocket_ws::Stream!['r], Error> {
     info!("Accepting Rocket WS connection from {}", ip.ip);
 
-    let token = if let Some(token) = data.access_token {
-        token
-    } else if let Some(token) = header_token.access_token {
+    let token = if let Some(token) = header_token.access_token {
         token
     } else {
-        err_code!("Invalid claim", 401)
+        err_code!("WS: Missing Authorization Bearer token", 401)
     };
 
     let Ok(claims) = crate::auth::decode_login(&token) else {
@@ -131,6 +171,9 @@ fn websockets_hub<'r>(
         let entry_uuid = uuid::Uuid::new_v4();
         let (tx, rx) = tokio::sync::mpsc::channel::<Message>(100);
         users.map.entry(claims.sub.to_string()).or_default().push((entry_uuid, tx));
+
+        // TASK-010-008: increment authenticated WS connection gauge
+        crate::metrics::METRICS.websocket_connections.inc();
 
         // Once the guard goes out of scope, the connection will have been closed and the entry will be deleted from the map
         (rx, WSEntryMapGuard::new(users, claims.sub, entry_uuid, ip.ip))
@@ -188,8 +231,21 @@ fn websockets_hub<'r>(
 
 #[allow(tail_expr_drop_order)]
 #[get("/anonymous-hub?<token..>")]
-fn anonymous_websockets_hub<'r>(ws: WebSocket, token: String, ip: ClientIp) -> Result<rocket_ws::Stream!['r], Error> {
+async fn anonymous_websockets_hub<'r>(ws: WebSocket, token: String, ip: ClientIp) -> Result<rocket_ws::Stream!['r], Error> {
     info!("Accepting Anonymous Rocket WS connection from {}", ip.ip);
+
+    // TASK-SEC-LOW-02-A: Per-IP rate limit for anonymous WS connections.
+    // Checked before the global cap so abusive IPs are rejected without consuming a slot.
+    crate::ratelimit::check_limit_anon_ws(&ip.ip).await?;
+
+    // TASK-RUSTDEV-HIGH-02: Enforce anonymous connection limit
+    if WS_ANON_ACTIVE.load(Ordering::Relaxed) >= *WS_ANON_MAX {
+        err_code!(
+            format!("Too many anonymous WebSocket connections (limit: {})", *WS_ANON_MAX),
+            429
+        )
+    }
+    WS_ANON_ACTIVE.fetch_add(1, Ordering::Relaxed);
 
     let (mut rx, guard) = {
         let subscriptions = Arc::clone(&WS_ANONYMOUS_SUBSCRIPTIONS);
@@ -197,6 +253,9 @@ fn anonymous_websockets_hub<'r>(ws: WebSocket, token: String, ip: ClientIp) -> R
         // Add a channel to send messages to this client to the map
         let (tx, rx) = tokio::sync::mpsc::channel::<Message>(100);
         subscriptions.map.insert(token.clone(), tx);
+
+        // TASK-010-008: increment anonymous WS connection gauge
+        crate::metrics::METRICS.websocket_connections.inc();
 
         // Once the guard goes out of scope, the connection will have been closed and the entry will be deleted from the map
         (rx, WSAnonymousEntryMapGuard::new(subscriptions, token, ip.ip))
@@ -326,12 +385,36 @@ pub struct WebSocketUsers {
     map: Arc<dashmap::DashMap<String, Vec<UserSenders>>>,
 }
 
+#[derive(Serialize, Deserialize)]
+pub enum WsPubSubMessage {
+    UserUpdate { user_uuid: String, data: Vec<u8> },
+    AnonymousUpdate { token: String, data: Vec<u8> },
+}
+
 impl WebSocketUsers {
     async fn send_update(&self, user_id: &UserId, data: &[u8]) {
+        if CONFIG.redis_enabled() {
+            let msg = WsPubSubMessage::UserUpdate {
+                user_uuid: user_id.to_string(),
+                data: data.to_vec(),
+            };
+            if let Ok(payload) = serde_json::to_string(&msg) {
+                let _unused = crate::cache::CACHE.publish("vw_ws_update", &payload).await;
+            }
+        } else {
+            self.send_update_local(user_id, data).await;
+        }
+    }
+
+    pub async fn send_update_local(&self, user_id: &UserId, data: &[u8]) {
         if let Some(user) = self.map.get(user_id.as_ref()).map(|v| v.clone()) {
             for (_, sender) in user.iter() {
+                // TASK-010-008: track WS events sent/failed
                 if let Err(e) = sender.send(Message::binary(data)).await {
                     error!("Error sending WS update {e}");
+                    crate::metrics::METRICS.websocket_events_failed.inc();
+                } else {
+                    crate::metrics::METRICS.websocket_events_sent.inc();
                 }
             }
         }
@@ -537,9 +620,27 @@ pub struct AnonymousWebSocketSubscriptions {
 
 impl AnonymousWebSocketSubscriptions {
     async fn send_update(&self, token: &str, data: &[u8]) {
+        if CONFIG.redis_enabled() {
+            let msg = WsPubSubMessage::AnonymousUpdate {
+                token: token.to_string(),
+                data: data.to_vec(),
+            };
+            if let Ok(payload) = serde_json::to_string(&msg) {
+                let _unused = crate::cache::CACHE.publish("vw_ws_update", &payload).await;
+            }
+        } else {
+            self.send_update_local(token, data).await;
+        }
+    }
+
+    pub async fn send_update_local(&self, token: &str, data: &[u8]) {
         if let Some(sender) = self.map.get(token).map(|v| v.clone()) {
+            // TASK-010-008: track anonymous WS events sent/failed
             if let Err(e) = sender.send(Message::binary(data)).await {
                 error!("Error sending WS update {e}");
+                crate::metrics::METRICS.websocket_events_failed.inc();
+            } else {
+                crate::metrics::METRICS.websocket_events_sent.inc();
             }
         }
     }
@@ -653,3 +754,60 @@ pub enum UpdateType {
 
 pub type Notify<'a> = &'a rocket::State<Arc<WebSocketUsers>>;
 pub type AnonymousNotify<'a> = &'a rocket::State<Arc<AnonymousWebSocketSubscriptions>>;
+
+#[cfg(feature = "redis")]
+pub fn start_redis_pubsub_listener() {
+    if !CONFIG.redis_enabled() {
+        return;
+    }
+
+    tokio::spawn(async move {
+        loop {
+            let client = match redis::Client::open(CONFIG.redis_url()) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Failed to create Redis client for PubSub: {}", e);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+
+            let mut con = match client.get_async_pubsub().await {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Failed to connect to Redis PubSub: {}", e);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+
+            if let Err(e) = con.subscribe("vw_ws_update").await {
+                error!("Failed to subscribe to Redis vw_ws_update channel: {}", e);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+
+            info!("Connected to Redis PubSub for vw_ws_update");
+            let mut stream = con.on_message();
+            
+            while let Some(msg) = stream.next().await {
+                let payload_res: redis::RedisResult<String> = msg.get_payload();
+                if let Ok(payload) = payload_res {
+                    if let Ok(ws_msg) = serde_json::from_str::<WsPubSubMessage>(&payload) {
+                        match ws_msg {
+                            WsPubSubMessage::UserUpdate { user_uuid, data } => {
+                                WS_USERS.send_update_local(&UserId::from(user_uuid), &data).await;
+                            }
+                            WsPubSubMessage::AnonymousUpdate { token, data } => {
+                                WS_ANONYMOUS_SUBSCRIPTIONS.send_update_local(&token, &data).await;
+                            }
+                        }
+                    }
+                }
+            }
+
+            warn!("Redis PubSub connection dropped. Reconnecting in 5 seconds...");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+}

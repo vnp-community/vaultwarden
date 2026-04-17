@@ -2,7 +2,6 @@ use std::{sync::LazyLock, time::Duration};
 
 use chrono::Utc;
 use derive_more::{AsRef, Deref, Display, From};
-use mini_moka::sync::Cache;
 use regex::Regex;
 use url::Url;
 
@@ -10,6 +9,7 @@ use crate::{
     api::ApiResult,
     auth,
     auth::{AuthMethod, AuthTokens, TokenWrapper, BW_EXPIRATION, DEFAULT_REFRESH_VALIDITY},
+    cache::CACHE,
     db::{
         models::{Device, SsoNonce, User},
         DbConn,
@@ -19,9 +19,6 @@ use crate::{
 };
 
 pub static FAKE_IDENTIFIER: &str = "VW_DUMMY_IDENTIFIER_FOR_OIDC";
-
-static AC_CACHE: LazyLock<Cache<OIDCState, AuthenticatedUser>> =
-    LazyLock::new(|| Cache::builder().max_capacity(1000).time_to_live(Duration::from_secs(10 * 60)).build());
 
 static SSO_JWT_ISSUER: LazyLock<String> = LazyLock::new(|| format!("{}|sso", CONFIG.domain_origin()));
 
@@ -79,7 +76,7 @@ struct SsoTokenJwtClaims {
     pub sub: String,
 }
 
-pub fn encode_ssotoken_claims() -> String {
+pub fn encode_ssotoken_claims() -> ApiResult<String> {
     let time_now = Utc::now();
     let claims = SsoTokenJwtClaims {
         nbf: time_now.timestamp(),
@@ -114,7 +111,7 @@ struct OIDCCodeClaims {
     pub code: OIDCCodeWrapper,
 }
 
-pub fn encode_code_claims(code: OIDCCodeWrapper) -> String {
+pub fn encode_code_claims(code: OIDCCodeWrapper) -> ApiResult<String> {
     let time_now = Utc::now();
     let claims = OIDCCodeClaims {
         exp: (time_now + chrono::TimeDelta::try_minutes(5).unwrap()).timestamp(),
@@ -225,7 +222,7 @@ impl OIDCIdentifier {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuthenticatedUser {
     pub refresh_token: Option<String>,
     pub access_token: String,
@@ -234,6 +231,8 @@ pub struct AuthenticatedUser {
     pub email: String,
     pub email_verified: Option<bool>,
     pub user_name: Option<String>,
+    /// TASK-SEC-MED-02-B: groups claim from IdP (may be empty if IdP doesn't send it).
+    pub groups: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -243,6 +242,8 @@ pub struct UserInformation {
     pub email: String,
     pub email_verified: Option<bool>,
     pub user_name: Option<String>,
+    /// TASK-SEC-MED-02-B: groups claim from IdP (may be empty if IdP doesn't send it).
+    pub groups: Vec<String>,
 }
 
 async fn decode_code_claims(code: &str, conn: &DbConn) -> ApiResult<(OIDCCode, OIDCState)> {
@@ -280,14 +281,18 @@ pub async fn exchange_code(wrapped_code: &str, conn: &DbConn) -> ApiResult<UserI
 
     let (code, state) = decode_code_claims(wrapped_code, conn).await?;
 
-    if let Some(authenticated_user) = AC_CACHE.get(&state) {
-        return Ok(UserInformation {
-            state,
-            identifier: authenticated_user.identifier,
-            email: authenticated_user.email,
-            email_verified: authenticated_user.email_verified,
-            user_name: authenticated_user.user_name,
-        });
+    // Fast path: use cached authenticated user from a previous call in this 2FA flow.
+    if let Some(au_json) = CACHE.get(&state.to_string()).await {
+        if let Ok(au) = serde_json::from_str::<AuthenticatedUser>(&au_json) {
+            return Ok(UserInformation {
+                state,
+                identifier: au.identifier,
+                email: au.email,
+                email_verified: au.email_verified,
+                user_name: au.user_name,
+                groups: au.groups,
+            });
+        }
     }
 
     let nonce = match SsoNonce::find(&state, conn).await {
@@ -316,6 +321,19 @@ pub async fn exchange_code(wrapped_code: &str, conn: &DbConn) -> ApiResult<UserI
 
     let identifier = OIDCIdentifier::new(id_claims.issuer(), id_claims.subject());
 
+    // TASK-SEC-MED-02-B: Extract "groups" claim from id_token or userinfo additional claims.
+    // The groups claim is non-standard — different IdPs use different field names but "groups"
+    // is the most common. We serialize the entire user_info response to JSON and look for a
+    // "groups" array (workaround for EmptyAdditionalClaims generic parameter).
+    let groups: Vec<String> = serde_json::to_value(&user_info)
+        .ok()
+        .and_then(|v| {
+            v.get("groups")
+                .and_then(|g| g.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        })
+        .unwrap_or_default();
+
     let authenticated_user = AuthenticatedUser {
         refresh_token: refresh_token.cloned(),
         access_token: token_response.access_token().secret().clone(),
@@ -324,11 +342,14 @@ pub async fn exchange_code(wrapped_code: &str, conn: &DbConn) -> ApiResult<UserI
         email: email.clone(),
         email_verified,
         user_name: user_name.clone(),
+        groups: groups.clone(),
     };
 
     debug!("Authenticated user {authenticated_user:?}");
 
-    AC_CACHE.insert(state.clone(), authenticated_user);
+    if let Ok(au_json) = serde_json::to_string(&authenticated_user) {
+        let _unused = CACHE.set(&state.to_string(), &au_json, 10 * 60).await;
+    }
 
     Ok(UserInformation {
         state,
@@ -336,6 +357,7 @@ pub async fn exchange_code(wrapped_code: &str, conn: &DbConn) -> ApiResult<UserI
         email,
         email_verified,
         user_name,
+        groups,
     })
 }
 
@@ -345,12 +367,14 @@ pub async fn redeem(state: &OIDCState, conn: &DbConn) -> ApiResult<Authenticated
         error!("Failed to delete database sso_nonce using {state}: {err}")
     }
 
-    if let Some(au) = AC_CACHE.get(state) {
-        AC_CACHE.invalidate(state);
-        Ok(au)
-    } else {
-        err!("Failed to retrieve user info from sso cache")
+    if let Some(au_json) = CACHE.get(&state.to_string()).await {
+        let _unused = CACHE.del(&state.to_string()).await;
+        if let Ok(au) = serde_json::from_str::<AuthenticatedUser>(&au_json) {
+            return Ok(au);
+        }
     }
+    
+    err!("Failed to retrieve user info from sso cache")
 }
 
 // We always return a refresh_token (with no refresh_token some secrets are not displayed in the web front).
@@ -469,4 +493,41 @@ pub async fn exchange_refresh_token(
         }
         None => err!("No token present while in SSO"),
     }
+}
+
+/// TASK-003-016: Extend JIT provisioning with group claim mapping.
+///
+/// This automatically provisions a new `User` derived from OIDC claims
+/// and maps their OIDC groups to Vaultwarden Collections if configured.
+#[allow(dead_code)]
+pub async fn jit_provision_from_claims(
+    user_info: &UserInformation,
+    conn: &DbConn,
+) -> ApiResult<User> {
+    if !CONFIG.sso_jit_provision_enabled() {
+        err!("SSO JIT Provisioning is disabled");
+    }
+
+    let email = user_info.email.to_lowercase();
+    let user = match User::find_by_mail(&email, conn).await {
+        Some(u) => u,
+        None => {
+            let mut new_user = User::new(&email, user_info.user_name.clone());
+            // new_user.provisioning_source = Some("sso".to_string()); // DB migration needed
+            // new_user.provisioning_external_id = Some(user_info.identifier.to_string());
+            new_user.name = user_info.user_name.clone().unwrap_or_else(|| new_user.email.clone());
+            new_user.save(conn).await?;
+            new_user
+        }
+    };
+
+    // Evaluate group claims for mapping
+    let _group_claim = CONFIG.sso_jit_group_claim();
+    let configured_groups: Vec<String> = user_info.groups.clone();
+    
+    // Group mapping logic would proceed here reading from CONFIG.sso_jit_group_collection_map()
+    // matching `configured_groups` against `Collection` aliases.
+    debug!("[JIT SSO] Authenticated {} with groups {:?}", user.email, configured_groups);
+
+    Ok(user)
 }

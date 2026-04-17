@@ -53,6 +53,7 @@ pub fn routes() -> Vec<rocket::Route> {
         post_delete_recover_token,
         post_delete_account,
         delete_account,
+        logout_all_devices,
         revision_date,
         password_hint,
         prelogin,
@@ -549,9 +550,30 @@ async fn post_password(data: Json<ChangePassData>, headers: Headers, conn: DbCon
     save_result
 }
 
+/// TASK-SEC-LOW-03-B: Validate and apply KDF parameters from client.
+/// Enforces minimum security thresholds set by ENFORCE_MIN_KDF / MIN_PBKDF2_ITERATIONS /
+/// MIN_ARGON2_MEMORY_KB. When ENFORCE_MIN_KDF=true (default), clients submitting weak params
+/// receive a 400 error. When false, a security warning is logged but the operation proceeds.
 fn set_kdf_data(user: &mut User, data: &KDFData) -> EmptyResult {
-    if data.kdf == UserKdfType::Pbkdf2 as i32 && data.kdf_iterations < 100_000 {
-        err!("PBKDF2 KDF iterations must be at least 100000.")
+    if data.kdf == UserKdfType::Pbkdf2 as i32 {
+        // Hard floor: below 100k is dangerous regardless of config
+        if data.kdf_iterations < 100_000 {
+            err!("PBKDF2 KDF iterations must be at least 100000.")
+        }
+        // Configurable policy minimum (default 600,000 per OWASP/NIST 2024)
+        let min_iters = CONFIG.min_pbkdf2_iterations() as i32;
+        if data.kdf_iterations < min_iters {
+            let msg = format!(
+                "PBKDF2 KDF iterations ({}) is below the configured minimum ({min_iters}). \
+                 Increase your client KDF iterations or set MIN_PBKDF2_ITERATIONS lower.",
+                data.kdf_iterations
+            );
+            if CONFIG.enforce_min_kdf() {
+                err!(msg)
+            } else {
+                warn!("SECURITY: {msg} (ENFORCE_MIN_KDF=false — allowed with warning)");
+            }
+        }
     }
 
     if data.kdf == UserKdfType::Argon2id as i32 {
@@ -561,6 +583,20 @@ fn set_kdf_data(user: &mut User, data: &KDFData) -> EmptyResult {
         if let Some(m) = data.kdf_memory {
             if !(15..=1024).contains(&m) {
                 err!("Argon2 memory must be between 15 MB and 1024 MB.")
+            }
+            // Configurable policy minimum (default 64 MB per OWASP)
+            let min_mem_kb = CONFIG.min_argon2_memory_kb() as i32;
+            let m_kb = m * 1024; // m is in MB, convert to KB for comparison
+            if m_kb < min_mem_kb {
+                let msg = format!(
+                    "Argon2id memory ({m} MB / {m_kb} KB) is below the configured minimum \
+                     ({min_mem_kb} KB). Increase your client KDF memory or set MIN_ARGON2_MEMORY_KB lower."
+                );
+                if CONFIG.enforce_min_kdf() {
+                    err!(msg)
+                } else {
+                    warn!("SECURITY: {msg} (ENFORCE_MIN_KDF=false — allowed with warning)");
+                }
             }
             user.client_kdf_memory = data.kdf_memory;
         } else {
@@ -1166,6 +1202,31 @@ async fn delete_account(data: Json<PasswordOrOtpData>, headers: Headers, conn: D
     data.validate(&user, true, &conn).await?;
 
     user.delete(&conn).await
+}
+
+/// SEC-HIGH-02-C: Logout all devices endpoint.
+/// Rotates the security_stamp (invalidating all existing JWTs), deletes all
+/// Device records (clearing push tokens), and sends logout WebSocket events.
+/// Requires master password or OTP re-confirmation.
+#[post("/accounts/logout-all", data = "<data>")]
+async fn logout_all_devices(
+    data: Json<PasswordOrOtpData>,
+    headers: Headers,
+    conn: DbConn,
+    nt: Notify<'_>,
+) -> EmptyResult {
+    let data: PasswordOrOtpData = data.into_inner();
+    let mut user = headers.user;
+
+    data.validate(&user, true, &conn).await?;
+
+    Device::delete_all_by_user(&user.uuid, &conn).await?;
+    user.reset_security_stamp();
+    let save_result = user.save(&conn).await;
+
+    nt.send_logout(&user, None, &conn).await;
+
+    save_result
 }
 
 #[get("/accounts/revision-date")]

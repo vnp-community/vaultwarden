@@ -148,6 +148,8 @@ pub struct DbPool {
     semaphore: Arc<Semaphore>,
 }
 
+pub static READ_POOL: OnceLock<DbPool> = OnceLock::new();
+
 impl Drop for DbConn {
     fn drop(&mut self) {
         let conn = Arc::clone(&self.conn);
@@ -225,6 +227,33 @@ impl DbPool {
         // Set a global to determine the database more easily throughout the rest of the code
         if ACTIVE_DB_TYPE.set(conn_type).is_err() {
             error!("Tried to set the active database connection type more than once.")
+        }
+
+        let database_read_url = CONFIG.database_read_url();
+        if !database_read_url.is_empty() {
+            let read_manager = DbConnManager::new(&database_read_url);
+            let read_max_conns = CONFIG.database_read_pool_size();
+            match Pool::builder()
+                .max_size(read_max_conns)
+                .min_idle(Some(CONFIG.database_min_conns()))
+                .idle_timeout(Some(Duration::from_secs(CONFIG.database_idle_timeout())))
+                .connection_timeout(Duration::from_secs(CONFIG.database_timeout()))
+                .connection_customizer(Box::new(DbConnOptions {
+                    init_stmts: DbConnType::from_url(&database_read_url)?.get_init_stmts(),
+                }))
+                .build(read_manager)
+            {
+                Ok(read_pool) => {
+                    drop(READ_POOL.set(DbPool {
+                        pool: Some(read_pool),
+                        semaphore: Arc::new(Semaphore::new(read_max_conns as usize)),
+                    }));
+                    info!("Successfully initialized database read replica pool.");
+                }
+                Err(e) => {
+                    error!("Initialising read replica pool failed: {}", e);
+                }
+            }
         }
 
         Ok(DbPool {
@@ -412,6 +441,45 @@ impl<'r> FromRequest<'r> for DbConn {
             },
             None => Outcome::Error((Status::InternalServerError, ())),
         }
+    }
+}
+
+pub struct DbReadConn(pub DbConn);
+
+impl std::ops::Deref for DbReadConn {
+    type Target = DbConn;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for DbReadConn {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for DbReadConn {
+    type Error = ();
+
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+         // TASK-005-015: If READ_POOL is configured, attempt to use it
+         if let Some(read_pool) = READ_POOL.get() {
+             if let Ok(dbconn) = read_pool.get().await {
+                 return Outcome::Success(DbReadConn(dbconn));
+             }
+         }
+
+         // Fallback to write pool if read pool is not configured or fails
+         match request.rocket().state::<DbPool>() {
+             Some(p) => match p.get().await {
+                 Ok(dbconn) => Outcome::Success(DbReadConn(dbconn)),
+                 _ => Outcome::Error((Status::ServiceUnavailable, ())),
+             },
+             None => Outcome::Error((Status::InternalServerError, ())),
+         }
     }
 }
 

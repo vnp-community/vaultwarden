@@ -840,6 +840,69 @@ pub fn is_global(ip: std::net::IpAddr) -> bool {
     ip.is_global()
 }
 
+/// SEC-HIGH-04-D: Resolve the real client IP, honouring X-Forwarded-For only
+/// when the direct connection comes from a configured trusted proxy CIDR.
+/// If `TRUSTED_PROXIES` is empty (default), the direct connection IP is always
+/// used and XFF headers are ignored, preventing IP spoofing.
+pub fn get_real_ip(req: &Request<'_>) -> std::net::IpAddr {
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::str::FromStr;
+
+    let direct_ip = req.remote().map(|r| r.ip()).unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+
+    let trusted_proxies_cfg = CONFIG.trusted_proxies();
+    if trusted_proxies_cfg.trim().is_empty() {
+        return direct_ip;
+    }
+
+    // Parse the comma-separated CIDR list and check if direct_ip is in a trusted range
+    let is_trusted = trusted_proxies_cfg.split(',').any(|cidr| {
+        let cidr = cidr.trim();
+        if let Some((network_str, prefix_len_str)) = cidr.split_once('/') {
+            if let (Ok(network), Ok(prefix_len)) = (IpAddr::from_str(network_str), prefix_len_str.parse::<u8>()) {
+                return ip_in_cidr(direct_ip, network, prefix_len);
+            }
+        } else if let Ok(single_ip) = IpAddr::from_str(cidr) {
+            return direct_ip == single_ip;
+        }
+        false
+    });
+
+    if is_trusted {
+        // Trust X-Forwarded-For: take the leftmost (client) IP
+        req.headers()
+            .get_one("X-Forwarded-For")
+            .and_then(|xff| xff.split(',').next())
+            .and_then(|ip_str| IpAddr::from_str(ip_str.trim()).ok())
+            .unwrap_or(direct_ip)
+    } else {
+        direct_ip
+    }
+}
+
+fn ip_in_cidr(ip: std::net::IpAddr, network: std::net::IpAddr, prefix_len: u8) -> bool {
+    use std::net::IpAddr;
+    match (ip, network) {
+        (IpAddr::V4(ip), IpAddr::V4(net)) => {
+            if prefix_len > 32 {
+                return false;
+            }
+            let mask = if prefix_len == 0 { 0u32 } else { !((1u32 << (32 - prefix_len)) - 1) };
+            (u32::from(ip) & mask) == (u32::from(net) & mask)
+        }
+        (IpAddr::V6(ip), IpAddr::V6(net)) => {
+            if prefix_len > 128 {
+                return false;
+            }
+            let ip_bits = u128::from(ip);
+            let net_bits = u128::from(net);
+            let mask = if prefix_len == 0 { 0u128 } else { !((1u128 << (128 - prefix_len)) - 1) };
+            (ip_bits & mask) == (net_bits & mask)
+        }
+        _ => false, // Mixed IPv4/IPv6
+    }
+}
+
 /// Saves a Rocket temporary file to the OpenDAL Operator at the given path.
 pub async fn save_temp_file(
     path_type: &PathType,
@@ -864,6 +927,42 @@ pub async fn save_temp_file(
 /// The IPv4 can be all checked in 30 seconds or so and they are correct as of nightly 2023-07-17
 /// The IPV6 can't be checked in a reasonable time, so we check over a hundred billion random ones, so far correct
 /// Note that the is_global implementation is subject to change as new IP RFCs are created
+pub struct MetricsFairing;
+
+#[derive(Copy, Clone)]
+pub struct MetricsStart(pub std::time::Instant);
+
+#[rocket::async_trait]
+impl Fairing for MetricsFairing {
+    fn info(&self) -> Info {
+        Info {
+            name: "Metrics Fairing",
+            kind: Kind::Request | Kind::Response,
+        }
+    }
+
+    async fn on_request(&self, req: &mut Request<'_>, _: &mut Data<'_>) {
+        req.local_cache(|| MetricsStart(std::time::Instant::now()));
+    }
+
+    async fn on_response<'r>(&self, req: &'r Request<'_>, res: &mut Response<'r>) {
+        if !CONFIG.metrics_enabled() {
+            return;
+        }
+        let start = req.local_cache(|| MetricsStart(std::time::Instant::now()));
+        let duration = start.0.elapsed().as_secs_f64();
+        let method = req.method().to_string();
+        let path = crate::metrics::normalize_metric_path(
+            &req.uri().path().url_decode_lossy()
+        );
+        let status = res.status().code.to_string();
+
+        let labels = crate::metrics::HttpLabels { method, path, status };
+        crate::metrics::METRICS.http_requests_total.get_or_create(&labels).inc();
+        crate::metrics::METRICS.http_request_duration_seconds.get_or_create(&labels).observe(duration);
+    }
+}
+
 ///
 /// To run while showing progress output:
 /// cargo +nightly test --release --features sqlite,unstable -- --nocapture --ignored

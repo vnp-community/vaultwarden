@@ -6,6 +6,19 @@ use crate::http_client::CustomHttpClientError;
 use serde::ser::{Serialize, SerializeStruct, Serializer};
 use std::error::Error as StdError;
 
+/// Semantic HTTP error category used for status mapping and structured logging.
+/// Distinct from the internal `ErrorKind` enum (which tracks the Rust error type).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorCategory {
+    NotFound,
+    Unauthorized,
+    Forbidden,
+    ValidationError,
+    DatabaseError,
+    InternalError,
+    ExternalServiceError,
+}
+
 macro_rules! make_error {
     ( $( $name:ident ( $ty:ty ): $src_fn:expr, $usr_msg_fun:expr ),+ $(,)? ) => {
         const BAD_REQUEST: u16 = 400;
@@ -14,14 +27,14 @@ macro_rules! make_error {
 
         #[derive(Debug)]
         pub struct ErrorEvent { pub event: EventType }
-        pub struct Error { message: String, error: ErrorKind, error_code: u16, event: Option<ErrorEvent> }
+        pub struct Error { message: String, error: ErrorKind, error_code: u16, event: Option<ErrorEvent>, pub category: ErrorCategory }
 
         $(impl From<$ty> for Error {
             fn from(err: $ty) -> Self { Error::from((stringify!($name), err)) }
         })+
         $(impl<S: Into<String>> From<(S, $ty)> for Error {
             fn from(val: (S, $ty)) -> Self {
-                Error { message: val.0.into(), error: ErrorKind::$name(val.1), error_code: BAD_REQUEST, event: None }
+                Error { message: val.0.into(), error: ErrorKind::$name(val.1), error_code: BAD_REQUEST, event: None, category: ErrorCategory::InternalError }
             }
         })+
         impl StdError for Error {
@@ -170,6 +183,32 @@ impl Error {
     pub fn message(&self) -> &str {
         &self.message
     }
+
+    #[must_use]
+    pub fn with_category(mut self, category: ErrorCategory) -> Self {
+        self.category = category;
+        self
+    }
+
+    pub fn not_found<M: Into<String> + Clone>(msg: M) -> Self {
+        Error::new_msg(msg).with_code(404).with_category(ErrorCategory::NotFound)
+    }
+
+    pub fn unauthorized<M: Into<String> + Clone>(msg: M) -> Self {
+        Error::new_msg(msg).with_code(401).with_category(ErrorCategory::Unauthorized)
+    }
+
+    pub fn forbidden<M: Into<String> + Clone>(msg: M) -> Self {
+        Error::new_msg(msg).with_code(403).with_category(ErrorCategory::Forbidden)
+    }
+
+    pub fn validation<M: Into<String> + Clone>(msg: M) -> Self {
+        Error::new_msg(msg).with_code(422).with_category(ErrorCategory::ValidationError)
+    }
+
+    pub fn internal<M: Into<String> + Clone>(msg: M) -> Self {
+        Error::new_msg(msg).with_code(500).with_category(ErrorCategory::InternalError)
+    }
 }
 
 pub trait MapResult<S> {
@@ -307,10 +346,25 @@ impl Responder<'_, 'static> for Error {
     fn respond_to(self, _: &Request<'_>) -> response::Result<'static> {
         match self.error {
             ErrorKind::Empty(_) | ErrorKind::Simple(_) | ErrorKind::Compact(_) => {} // Don't print the error in this situation
-            _ => error!(target: "error", "{self:#?}"),
+            _ => {
+                // Log internal/database errors with full detail; semantic errors at debug level
+                match self.category {
+                    ErrorCategory::InternalError | ErrorCategory::DatabaseError | ErrorCategory::ExternalServiceError => {
+                        error!(target: "error", "{self:#?}")
+                    }
+                    _ => debug!(target: "error", "{self:#?}"),
+                }
+            }
         };
 
-        let code = Status::from_code(self.error_code).unwrap_or(Status::BadRequest);
+        // Prefer the ErrorCategory-derived status over the raw error_code for semantic errors
+        let code = match self.category {
+            ErrorCategory::NotFound => Status::NotFound,
+            ErrorCategory::Unauthorized => Status::Unauthorized,
+            ErrorCategory::Forbidden => Status::Forbidden,
+            ErrorCategory::ValidationError => Status::UnprocessableEntity,
+            _ => Status::from_code(self.error_code).unwrap_or(Status::BadRequest),
+        };
         let body = self.to_string();
         Response::build().status(code).header(ContentType::JSON).sized_body(Some(body.len()), Cursor::new(body)).ok()
     }
@@ -381,6 +435,69 @@ macro_rules! err_code {
     }};
 }
 
+/// Typed error macros — set both the HTTP status code and ErrorCategory.
+/// Use these in handlers instead of plain `err!` for semantic errors.
+/// Each macro accepts an optional second arg as the log message (like `err!`).
+#[macro_export]
+macro_rules! err_not_found {
+    ($msg:expr) => {{
+        let msg = $msg;
+        error!("{msg}");
+        return Err($crate::error::Error::not_found(msg));
+    }};
+    ($usr_msg:expr, $log_value:expr) => {{
+        let usr_msg = $usr_msg;
+        let log_value = $log_value;
+        error!("{usr_msg}. {log_value}");
+        return Err($crate::error::Error::not_found(usr_msg));
+    }};
+}
+
+#[macro_export]
+macro_rules! err_unauthorized {
+    ($msg:expr) => {{
+        let msg = $msg;
+        error!("{msg}");
+        return Err($crate::error::Error::unauthorized(msg));
+    }};
+    ($usr_msg:expr, $log_value:expr) => {{
+        let usr_msg = $usr_msg;
+        let log_value = $log_value;
+        error!("{usr_msg}. {log_value}");
+        return Err($crate::error::Error::unauthorized(usr_msg));
+    }};
+}
+
+#[macro_export]
+macro_rules! err_forbidden {
+    ($msg:expr) => {{
+        let msg = $msg;
+        error!("{msg}");
+        return Err($crate::error::Error::forbidden(msg));
+    }};
+    ($usr_msg:expr, $log_value:expr) => {{
+        let usr_msg = $usr_msg;
+        let log_value = $log_value;
+        error!("{usr_msg}. {log_value}");
+        return Err($crate::error::Error::forbidden(usr_msg));
+    }};
+}
+
+#[macro_export]
+macro_rules! err_validation {
+    ($msg:expr) => {{
+        let msg = $msg;
+        error!("{msg}");
+        return Err($crate::error::Error::validation(msg));
+    }};
+    ($usr_msg:expr, $log_value:expr) => {{
+        let usr_msg = $usr_msg;
+        let log_value = $log_value;
+        error!("{usr_msg}. {log_value}");
+        return Err($crate::error::Error::validation(usr_msg));
+    }};
+}
+
 #[macro_export]
 macro_rules! err_discard {
     ($msg:expr, $data:expr) => {{
@@ -415,4 +532,91 @@ macro_rules! err_handler {
         error!(target: "auth", "Unauthorized Error: {usr_msg}. {log_value}");
         return ::rocket::request::Outcome::Error((rocket::http::Status::Unauthorized, usr_msg));
     }};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -------------------------------------------------------------------------
+    // TASK-RUSTDEV-LOW-02-B: ErrorCategory → HTTP status mapping
+    // -------------------------------------------------------------------------
+
+    /// Error::not_found must set category=NotFound and error_code=404.
+    #[test]
+    fn test_not_found_category_and_code() {
+        let e = Error::not_found("resource missing");
+        assert_eq!(e.category, ErrorCategory::NotFound);
+        assert_eq!(e.error_code, 404);
+        assert_eq!(e.message(), "resource missing");
+    }
+
+    /// Error::unauthorized must set category=Unauthorized and error_code=401.
+    #[test]
+    fn test_unauthorized_category_and_code() {
+        let e = Error::unauthorized("bad token");
+        assert_eq!(e.category, ErrorCategory::Unauthorized);
+        assert_eq!(e.error_code, 401);
+    }
+
+    /// Error::forbidden must set category=Forbidden and error_code=403.
+    #[test]
+    fn test_forbidden_category_and_code() {
+        let e = Error::forbidden("access denied");
+        assert_eq!(e.category, ErrorCategory::Forbidden);
+        assert_eq!(e.error_code, 403);
+    }
+
+    /// Error::validation must set category=ValidationError and error_code=422.
+    #[test]
+    fn test_validation_category_and_code() {
+        let e = Error::validation("bad input");
+        assert_eq!(e.category, ErrorCategory::ValidationError);
+        assert_eq!(e.error_code, 422);
+    }
+
+    /// Error::internal must set category=InternalError and error_code=500.
+    #[test]
+    fn test_internal_category_and_code() {
+        let e = Error::internal("something broke");
+        assert_eq!(e.category, ErrorCategory::InternalError);
+        assert_eq!(e.error_code, 500);
+    }
+
+    /// Default errors created via Error::new must have InternalError category.
+    #[test]
+    fn test_default_category_is_internal() {
+        let e = Error::new("oops", "detail");
+        assert_eq!(e.category, ErrorCategory::InternalError);
+    }
+
+    /// with_category builder must override the category field.
+    #[test]
+    fn test_with_category_builder() {
+        let e = Error::new("msg", "").with_category(ErrorCategory::DatabaseError);
+        assert_eq!(e.category, ErrorCategory::DatabaseError);
+    }
+
+    /// Five distinct categories must all be non-equal to each other.
+    #[test]
+    fn test_error_category_variants_distinct() {
+        let cats = [
+            ErrorCategory::NotFound,
+            ErrorCategory::Unauthorized,
+            ErrorCategory::Forbidden,
+            ErrorCategory::ValidationError,
+            ErrorCategory::InternalError,
+            ErrorCategory::DatabaseError,
+            ErrorCategory::ExternalServiceError,
+        ];
+        for i in 0..cats.len() {
+            for j in 0..cats.len() {
+                if i == j {
+                    assert_eq!(cats[i], cats[j]);
+                } else {
+                    assert_ne!(cats[i], cats[j]);
+                }
+            }
+        }
+    }
 }

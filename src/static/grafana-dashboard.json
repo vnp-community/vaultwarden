@@ -1,0 +1,108 @@
+{
+  "title": "Vaultwarden Operations Dashboard",
+  "uid": "vaultwarden-ops",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "30s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Login Rate (per minute)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "rate(vaultwarden_login_attempts_total{result=\"success\"}[1m])",
+          "legendFormat": "Success"
+        },
+        {
+          "expr": "rate(vaultwarden_login_attempts_total{result=\"failure\"}[1m])",
+          "legendFormat": "Failure"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+    },
+    {
+      "id": 2,
+      "title": "Active Sessions",
+      "type": "stat",
+      "targets": [{"expr": "vaultwarden_active_sessions", "legendFormat": "Sessions"}],
+      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0}
+    },
+    {
+      "id": 3,
+      "title": "WebSocket Connections",
+      "type": "stat",
+      "targets": [{"expr": "vaultwarden_websocket_connections", "legendFormat": "WS"}],
+      "gridPos": {"h": 4, "w": 4, "x": 16, "y": 0}
+    },
+    {
+      "id": 4,
+      "title": "HTTP Request Duration (p99)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(vaultwarden_http_request_duration_seconds_bucket[5m])) by (le, path))",
+          "legendFormat": "{{path}} p99"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+    },
+    {
+      "id": 5,
+      "title": "HTTP Error Rate",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "rate(vaultwarden_http_requests_total{status=~\"4..|5..\"}[5m])",
+          "legendFormat": "{{status}} {{path}}"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}
+    },
+    {
+      "id": 6,
+      "title": "Background Job Runs",
+      "type": "bargauge",
+      "targets": [
+        {
+          "expr": "increase(vaultwarden_job_runs_total[1h])",
+          "legendFormat": "{{job}}"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16}
+    },
+    {
+      "id": 7,
+      "title": "Rate Limit Triggers",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "rate(vaultwarden_rate_limit_triggers_total[1m])",
+          "legendFormat": "{{route}}"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16}
+    },
+    {
+      "id": 8,
+      "title": "Database Pool",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "vaultwarden_db_pool_size", "legendFormat": "Size"},
+        {"expr": "vaultwarden_db_pool_idle", "legendFormat": "Idle"}
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24}
+    },
+    {
+      "id": 9,
+      "title": "Total Users / Ciphers / Orgs",
+      "type": "stat",
+      "targets": [
+        {"expr": "vaultwarden_users_total", "legendFormat": "Users"},
+        {"expr": "vaultwarden_ciphers_total", "legendFormat": "Ciphers"},
+        {"expr": "vaultwarden_organizations_total", "legendFormat": "Orgs"}
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24}
+    }
+  ]
+}

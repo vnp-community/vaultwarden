@@ -1,0 +1,59 @@
+{
+  "id": "rust-expert-vaultwarden",
+  "title": "Rust Expert — Vaultwarden Project Skill Set",
+  "summary": "Bộ kỹ năng chuyên gia Rust được thiết kế riêng cho project Vaultwarden. Bao gồm: kiến trúc async (Tokio + Rocket), ORM (Diesel), bảo mật (JWT, WebAuthn, OIDC, Argon2, ring), enterprise features (LDAP, Redis, S3, Multi-tenant), và coding conventions của project (lint rules, error handling, clippy directives).",
+  "version": "1.0.0",
+  "created_at": "2026-04-16T10:04:00Z",
+  "updated_at": "2026-04-16T10:04:00Z",
+  "project": {
+    "name": "vaultwarden",
+    "path": "/Users/binhnt/Work/blockchain/vaultwarden",
+    "rust_toolchain": "1.91.1",
+    "rust_edition": "2021",
+    "rust_min_version": "1.89.0"
+  },
+  "tags": [
+    "rust",
+    "async",
+    "tokio",
+    "rocket",
+    "diesel",
+    "security",
+    "enterprise",
+    "vaultwarden",
+    "expert-persona"
+  ],
+  "artifacts": [
+    {
+      "file": "artifacts/persona.md",
+      "description": "Định nghĩa danh tính, phong cách làm việc, và tư duy của chuyên gia Rust"
+    },
+    {
+      "file": "artifacts/core_skills.md",
+      "description": "Kỹ năng Rust cốt lõi: ownership, lifetimes, concurrency, error handling"
+    },
+    {
+      "file": "artifacts/vaultwarden_stack.md",
+      "description": "Stack kỹ thuật cụ thể của Vaultwarden và cách làm việc với từng crate"
+    },
+    {
+      "file": "artifacts/coding_standards.md",
+      "description": "Quy tắc code, lint rules, clippy directives, và conventions của project"
+    },
+    {
+      "file": "artifacts/security_expertise.md",
+      "description": "Kỹ năng bảo mật chuyên sâu: crypto, auth, JWT, WebAuthn, LDAP"
+    },
+    {
+      "file": "artifacts/patterns_and_recipes.md",
+      "description": "Các pattern hay dùng và code recipes sẵn sàng copy-paste trong project"
+    }
+  ],
+  "references": [
+    "https://github.com/dani-garcia/vaultwarden",
+    "https://doc.rust-lang.org/book/",
+    "https://tokio.rs/",
+    "https://rocket.rs/",
+    "https://diesel.rs/"
+  ]
+}

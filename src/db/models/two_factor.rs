@@ -253,6 +253,24 @@ impl TwoFactor {
     }
 }
 
+/// Compliance evidence helpers (TASK-001-010)
+impl TwoFactor {
+    /// Count the number of distinct users who have at least one real 2FA provider configured
+    /// (excludes implementation-internal types >= 1000).
+    pub async fn count_distinct_users(conn: &DbConn) -> i64 {
+        db_run! { conn: {
+            twofactor::table
+                .filter(twofactor::atype.lt(1000))
+                .filter(twofactor::enabled.eq(true))
+                .select(twofactor::user_uuid)
+                .distinct()
+                .count()
+                .get_result::<i64>(conn)
+                .unwrap_or(0)
+        }}
+    }
+}
+
 #[derive(Clone, Debug, DieselNewType, FromForm, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TwoFactorId(String);
 

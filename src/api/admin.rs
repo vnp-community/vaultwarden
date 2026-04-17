@@ -37,12 +37,26 @@ use crate::{
     CONFIG, VERSION,
 };
 
+pub mod backup;
+pub mod devices;
+
+/// TASK-010-017: Serve the pre-built Grafana dashboard JSON
+#[get("/grafana-dashboard")]
+pub fn get_grafana_dashboard(_token: AdminToken) -> Result<rocket::response::content::RawJson<String>, Status> {
+    use std::path::Path;
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/static/grafana-dashboard.json");
+    match std::fs::read_to_string(&path) {
+        Ok(content) => Ok(rocket::response::content::RawJson(content)),
+        Err(_) => Err(Status::NotFound),
+    }
+}
+
 pub fn routes() -> Vec<Route> {
     if !CONFIG.disable_admin_token() && !CONFIG.is_admin_token_set() {
         return routes![admin_disabled];
     }
 
-    routes![
+    let mut r = routes![
         get_users_json,
         get_user_json,
         get_user_by_mail_json,
@@ -70,7 +84,11 @@ pub fn routes() -> Vec<Route> {
         get_diagnostics_config,
         resend_user_invite,
         get_diagnostics_http,
-    ]
+        rotate_jwt_key,
+        get_grafana_dashboard,
+    ];
+    r.extend(devices::routes());
+    r
 }
 
 pub fn catchers() -> Vec<Catcher> {
@@ -182,7 +200,7 @@ struct LoginForm {
 }
 
 #[post("/", format = "application/x-www-form-urlencoded", data = "<data>")]
-fn post_admin_login(
+async fn post_admin_login(
     data: Form<LoginForm>,
     cookies: &CookieJar<'_>,
     ip: ClientIp,
@@ -191,7 +209,7 @@ fn post_admin_login(
     let data = data.into_inner();
     let redirect = data.redirect;
 
-    if crate::ratelimit::check_limit_admin(&ip.ip).is_err() {
+    if crate::ratelimit::check_limit_admin(&ip.ip).await.is_err() {
         return Err(AdminResponse::TooManyRequests(render_admin_login(
             Some("Too many requests, try again later."),
             redirect.as_deref(),
@@ -208,7 +226,16 @@ fn post_admin_login(
     } else {
         // If the token received is valid, generate JWT and save it as a cookie
         let claims = generate_admin_claims();
-        let jwt = encode_jwt(&claims);
+        let jwt = match encode_jwt(&claims) {
+            Ok(t) => t,
+            Err(e) => {
+                error!("Failed to encode admin JWT: {e:#?}");
+                return Err(AdminResponse::Unauthorized(render_admin_login(
+                    Some("Failed to create admin session token."),
+                    redirect.as_deref(),
+                )));
+            }
+        };
 
         let cookie = Cookie::build((COOKIE_NAME, jwt))
             .path(admin_path())
@@ -224,6 +251,80 @@ fn post_admin_login(
             Err(AdminResponse::Ok(render_admin_page()))
         }
     }
+}
+
+/// TASK-SEC-CRIT-01: Validate that ADMIN_TOKEN is an Argon2id PHC hash.
+/// Called at startup. In strict mode (default), the server refuses to start
+/// if a plaintext token is configured.
+pub fn validate_admin_token() -> Result<(), Error> {
+    // If admin is entirely disabled there is nothing to validate
+    if CONFIG.disable_admin_token() || !CONFIG.is_admin_token_set() {
+        return Ok(());
+    }
+    let token = CONFIG.admin_token().unwrap_or_default();
+    if !token.trim().starts_with("$argon2") {
+        error!(
+            "SECURITY CRITICAL: ADMIN_TOKEN is a plaintext string, not an Argon2id PHC hash. \
+             Plaintext tokens are vulnerable to brute-force attacks. \
+             Generate a secure hash with: vaultwarden hash --preset owasp"
+        );
+        if CONFIG.admin_token_strict_mode() {
+            return Err(Error::new(
+                "ADMIN_TOKEN must be an Argon2id PHC hash (starts with $argon2). \
+                 Set ADMIN_TOKEN_STRICT_MODE=false to allow plaintext tokens (not recommended).",
+                "",
+            ));
+        }
+        warn!("Admin panel is using an INSECURE plaintext token. Set ADMIN_TOKEN_STRICT_MODE=true to enforce Argon2id.");
+    }
+    Ok(())
+}
+
+/// TASK-SEC-CRIT-02: Validate DISABLE_ADMIN_TOKEN requires double-confirmation.
+/// Called at startup. Refuses to start if DISABLE_ADMIN_TOKEN=true without
+/// DISABLE_ADMIN_TOKEN_CONFIRM=true being explicitly set.
+/// TASK-SEC-CRIT-02-C: Also enforces IP allowlist must be non-empty when
+/// IP_ALLOWLIST_ADMIN_PANEL=true.
+/// TASK-SEC-CRIT-02-E: Emits structured startup audit log when admin token is disabled.
+pub fn validate_disable_admin_token() -> Result<(), Error> {
+    if !CONFIG.disable_admin_token() {
+        return Ok(());
+    }
+    if !CONFIG.disable_admin_token_confirmed() {
+        error!(
+            "SECURITY WARNING: DISABLE_ADMIN_TOKEN=true but DISABLE_ADMIN_TOKEN_CONFIRMED is not set. \
+             Admin panel would be completely unauthenticated. \
+             Set DISABLE_ADMIN_TOKEN_CONFIRMED=true only if you have external auth protecting the admin panel."
+        );
+        return Err(Error::new(
+            "Must set DISABLE_ADMIN_TOKEN_CONFIRMED=true alongside DISABLE_ADMIN_TOKEN=true. \
+             This double-confirmation is required to prevent accidental unauthenticated admin panel exposure.",
+            "",
+        ));
+    }
+
+    // TASK-SEC-CRIT-02-C: If IP_ALLOWLIST_ADMIN_PANEL=true, require a non-empty allowlist
+    if CONFIG.ip_allowlist_admin_panel() && CONFIG.admin_panel_ip_allowlist().trim().is_empty() {
+        error!(
+            "SECURITY ERROR: IP_ALLOWLIST_ADMIN_PANEL=true but ADMIN_PANEL_IP_ALLOWLIST is empty. \
+             The admin panel is unauthenticated -- you must specify allowed IPs in ADMIN_PANEL_IP_ALLOWLIST. \
+             Example: ADMIN_PANEL_IP_ALLOWLIST=10.0.0.0/8,192.168.1.100"
+        );
+        return Err(Error::new(
+            "ADMIN_PANEL_IP_ALLOWLIST must not be empty when IP_ALLOWLIST_ADMIN_PANEL=true and DISABLE_ADMIN_TOKEN=true.",
+            "",
+        ));
+    }
+
+    // TASK-SEC-CRIT-02-E: Structured startup audit log -- emitted every restart when admin token disabled
+    let ip_allowlist_active = CONFIG.ip_allowlist_admin_panel() && !CONFIG.admin_panel_ip_allowlist().trim().is_empty();
+    warn!(
+        "SECURITY AUDIT [ServerStart]: Admin panel authentication is DISABLED (DISABLE_ADMIN_TOKEN=true). \
+         ip_allowlist_active={ip_allowlist_active} | \
+         Ensure the admin panel is protected by a network-level auth layer (reverse proxy, VPN, or IP allowlist)."
+    );
+
+    Ok(())
 }
 
 fn _validate_token(token: &str) -> bool {
@@ -843,4 +944,44 @@ impl<'r> FromRequest<'r> for AdminToken {
             ip,
         })
     }
+}
+
+/// TASK-SEC-LOW-01-A: Admin endpoint to hot-rotate the JWT signing RSA key.
+/// POST /admin/rotate-jwt-key
+///
+/// This endpoint:
+/// 1. Generates a new RSA-2048 key pair and hot-swaps it (no restart required)
+/// 2. Resets the security_stamp of ALL users, invalidating every active session
+///    immediately (clients will get 401 on next request and must re-log-in)
+///
+/// ⚠ WARNING: Use during a maintenance window or when a key compromise is suspected.
+/// All currently authenticated users will need to sign in again.
+#[post("/rotate-jwt-key")]
+async fn rotate_jwt_key(token: AdminToken, conn: DbConn) -> JsonResult {
+    info!("[KeyRotation] Admin {} triggered JWT signing key rotation", token.ip.ip);
+
+    // Step 1: Rotate the key
+    let new_pub_pem = crate::auth::rotate_jwt_signing_key().await?;
+
+    // Step 2: Invalidate all existing sessions by resetting every user's security_stamp
+    let all_users = User::get_all(&conn).await;
+    let user_count = all_users.len();
+    for (mut user, _sso) in all_users {
+        user.reset_security_stamp();
+        if let Err(e) = user.save(&conn).await {
+            error!("[KeyRotation] Failed to reset security_stamp for user {}: {e}", user.uuid);
+        }
+    }
+
+    warn!(
+        "[KeyRotation] JWT signing key rotated successfully. {} user sessions invalidated. \
+         All users must re-authenticate.",
+        user_count
+    );
+
+    Ok(Json(json!({
+        "success": true,
+        "message": format!("JWT signing key rotated. {} user sessions invalidated.", user_count),
+        "new_public_key_pem": new_pub_pem,
+    })))
 }

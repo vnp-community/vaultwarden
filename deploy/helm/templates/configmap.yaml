@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "vaultwarden.fullname" . }}-config
+  labels:
+    app.kubernetes.io/name: {{ include "vaultwarden.name" . }}
+data:
+  CLUSTER_MODE: {{ .Values.config.clusterMode | quote }}
+  REDIS_ENABLED: {{ .Values.config.redisEnabled | quote }}
+  REDIS_URL: {{ .Values.config.redisUrl | quote }}
+  DATABASE_URL: {{ .Values.config.databaseUrl | quote }}
+  DATABASE_READ_URL: {{ .Values.config.databaseReadUrl | quote }}
+  DATABASE_MAX_CONNS: {{ .Values.config.databasePoolSize | quote }}
+  DATABASE_READ_POOL_SIZE: {{ .Values.config.databaseReadPoolSize | quote }}
+  ENABLE_WEBSOCKET: {{ .Values.config.enableWebsocket | quote }}
+  SHUTDOWN_TIMEOUT_SECONDS: {{ .Values.config.shutdownTimeoutSeconds | quote }}

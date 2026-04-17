@@ -31,6 +31,15 @@ pub struct Device {
 
     pub refresh_token: String,
     pub twofactor_remember: Option<String>,
+
+    pub is_trusted: bool,
+    pub mdm_enrolled: bool,
+    pub mdm_compliant: bool,
+    pub mdm_last_check_at: Option<NaiveDateTime>,
+    pub cert_subject: Option<String>,
+    pub cert_serial: Option<String>,
+    pub cert_expires_at: Option<NaiveDateTime>,
+    pub cert_issuer: Option<String>,
 }
 
 /// Local methods
@@ -131,6 +140,15 @@ impl Device {
             push_token: None,
             refresh_token: crypto::encode_random_bytes::<64>(&BASE64URL),
             twofactor_remember: None,
+
+            is_trusted: false,
+            mdm_enrolled: false,
+            mdm_compliant: false,
+            mdm_last_check_at: None,
+            cert_subject: None,
+            cert_serial: None,
+            cert_expires_at: None,
+            cert_issuer: None,
         };
 
         device.inner_save(conn).await.map(|()| device)

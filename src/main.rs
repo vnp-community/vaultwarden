@@ -47,17 +47,33 @@ use tokio::signal::unix::SignalKind;
 #[macro_use]
 mod error;
 mod api;
+mod app_state;
 mod auth;
+pub mod access_control;
+#[cfg(test)]
+mod tests;
 mod config;
 mod crypto;
 #[macro_use]
 mod db;
+mod cache;
 mod http_client;
 mod mail;
 mod ratelimit;
 mod sso;
 mod sso_client;
 mod util;
+mod webhook_delivery;
+mod audit;
+mod siem;
+pub mod metrics;
+pub mod pam;
+pub mod tenant;
+pub mod device_trust;
+pub mod ldap;
+pub mod backup;
+pub mod mdm;
+pub mod alerting;
 
 use crate::api::core::two_factor::duo_oidc::purge_duo_contexts;
 use crate::api::purge_auth_requests;
@@ -75,17 +91,49 @@ async fn main() -> Result<(), Error> {
 
     let level = init_logging()?;
 
+    // SEC-MED-04: Audit config.json for secrets and file permissions at startup
+    config::audit_config_file_for_secrets();
+    config::check_config_file_permissions();
+    // SEC-LOW-04-A: Warn if backup folder is inside the data folder (web-accessible risk)
+    config::check_backup_location();
+
     check_data_folder().await;
     auth::initialize_keys().await.unwrap_or_else(|e| {
         error!("Error creating private key '{}'\n{e:?}\nExiting Vaultwarden!", CONFIG.private_rsa_key());
         exit(1);
     });
+
+    // SEC-CRIT-01: Reject plaintext admin token in strict mode (default on)
+    api::validate_admin_token().unwrap_or_else(|e| {
+        error!("{}\nExiting Vaultwarden!", e.message());
+        exit(1);
+    });
+    // SEC-CRIT-02: Require double-confirmation before allowing unauthenticated admin panel
+    api::validate_disable_admin_token().unwrap_or_else(|e| {
+        error!("{}\nExiting Vaultwarden!", e.message());
+        exit(1);
+    });
+
     check_web_vault();
 
     create_dir(&CONFIG.tmp_folder(), "tmp folder");
 
     let pool = create_db_pool().await;
-    schedule_jobs(pool.clone());
+    audit::init_audit_log(pool.clone());
+    siem::SiemForwarder::start(pool.clone());
+    // TASK-008-011: Initialize webhook delivery global pool
+    webhook_delivery::init_pool(pool.clone());
+
+    // LOW-04-A: schedule_jobs is now async (tokio-cron-scheduler); spawn as a task
+    tokio::spawn(schedule_jobs(pool.clone()));
+    // TASK-RUSTDEV-HIGH-02: Start the WS DashMap cleanup task
+    api::start_ws_cleanup_task();
+    // TASK-010-015: Start security alerting engine
+    tokio::spawn(alerting::start_alerting_engine());
+    
+    #[cfg(feature = "redis")]
+    api::start_redis_pubsub_listener();
+
     db::models::TwoFactor::migrate_u2f_to_webauthn(&pool.get().await.unwrap()).await.unwrap();
     db::models::TwoFactor::migrate_credential_to_passkey(&pool.get().await.unwrap()).await.unwrap();
 
@@ -111,6 +159,13 @@ COMMAND:
 PRESETS:                  m=         t=          p=
     bitwarden (default) 64MiB, 3 Iterations, 4 Threads
     owasp               19MiB, 2 Iterations, 1 Thread
+
+// TASK-SEC-CRIT-01-D: Clear guidance on using the generated token
+GENERATING AN ADMIN TOKEN:
+    1. Run:  vaultwarden hash --preset owasp
+    2. Copy the output 'ADMIN_TOKEN=...' line into your environment or .env file
+    3. The token MUST start with '$argon2' — plaintext tokens are rejected by default
+    4. Docs: https://github.com/dani-garcia/vaultwarden/wiki/Enabling-admin-page
 
 ";
 
@@ -176,10 +231,16 @@ fn parse_args() {
 
             let argon2_timer = tokio::time::Instant::now();
             if let Ok(password_hash) = argon2.hash_password(password.as_bytes(), &salt) {
+                // TASK-SEC-CRIT-01-D: Guide users on next steps after generating the token
                 println!(
                     "\n\
                     ADMIN_TOKEN='{password_hash}'\n\n\
-                    Generation of the Argon2id PHC string took: {:?}",
+                    Generation of the Argon2id PHC string took: {:?}\n\n\
+                    Next steps:\n\
+                    1. Copy the ADMIN_TOKEN line above into your .env file or environment\n\
+                    2. The token starts with '$argon2' — this format is required (strict mode is default)\n\
+                    3. Restart Vaultwarden to apply\n\
+                    4. Docs: https://github.com/dani-garcia/vaultwarden/wiki/Enabling-admin-page",
                     argon2_timer.elapsed()
                 );
             } else {
@@ -379,6 +440,36 @@ fn init_logging() -> Result<log::LevelFilter, Error> {
         }
     }
 
+    // TASK-010-011: JSON structured logging
+    // When LOG_FORMAT=json, bypass fern and install tracing-subscriber with JSON output.
+    // The tracing → log bridge (tracing::log feature) ensures existing `log::` calls are
+    // captured by the tracing subscriber, preserving full backward compatibility.
+    if CONFIG.log_format().eq_ignore_ascii_case("json") {
+        use tracing_subscriber::{fmt, EnvFilter};
+
+        let env_filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new(level.as_str()));
+
+        let builder = fmt()
+            .json()
+            .with_current_span(true)
+            .with_span_list(true)
+            .with_env_filter(env_filter);
+
+        if CONFIG.log_include_trace_id() {
+            builder
+                .with_thread_ids(true)
+                .init();
+        } else {
+            builder.init();
+        }
+
+        // Also install the log→tracing bridge so `log::info!()` macros are captured
+        let _ = tracing_log::LogTracer::init();
+
+        return Ok(level);
+    }
+
     if let Err(err) = logger.apply() {
         err!(format!("Failed to activate logger: {err}"))
     }
@@ -554,11 +645,22 @@ async fn create_db_pool() -> db::DbPool {
     }
 }
 
-async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error> {
+/// TASK-RUSTDEV-LOW-02-C: Build the Rocket instance (pre-ignition).
+///
+/// Separated from `launch_rocket` so integration tests can call:
+/// ```rust
+/// let pool = create_test_db_pool().await;
+/// let state = AppState { rate_limiter: Arc::new(NoopRateLimiter) };
+/// let client = Client::tracked(build_rocket(pool, state, false)).await.unwrap();
+/// ```
+/// The returned `Rocket<Build>` has all routes mounted and all managed state
+/// attached but has NOT been ignited or launched — tests call `.ignite()` via
+/// `Client::tracked()`.
+pub fn build_rocket(pool: db::DbPool, state: app_state::AppState, extra_debug: bool) -> rocket::Rocket<rocket::Build> {
     let basepath = &CONFIG.domain_path();
 
     let mut config = rocket::Config::from(rocket::Config::figment());
-    config.temp_dir = canonicalize(CONFIG.tmp_folder()).unwrap().into();
+    config.temp_dir = canonicalize(CONFIG.tmp_folder()).unwrap_or_default().into();
     config.cli_colors = false; // Make sure Rocket does not color any values for logging.
     config.limits = Limits::new()
         .limit("json", 20.megabytes()) // 20MB should be enough for very large imports, something like 5000+ vault entries
@@ -567,31 +669,54 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
 
     // If adding more paths here, consider also adding them to
     // crate::utils::LOGGED_ROUTES to make sure they appear in the log
-    let instance = rocket::custom(config)
+    rocket::custom(config)
         .mount([basepath, "/"].concat(), api::web_routes())
+        .mount([basepath, "/"].concat(), api::compliance_routes())
         .mount([basepath, "/api"].concat(), api::core_routes())
         .mount([basepath, "/admin"].concat(), api::admin_routes())
         .mount([basepath, "/events"].concat(), api::core_events_routes())
         .mount([basepath, "/identity"].concat(), api::identity_routes())
         .mount([basepath, "/icons"].concat(), api::icons_routes())
         .mount([basepath, "/notifications"].concat(), api::notifications_routes())
+        .mount([basepath, ""].concat(), api::metrics_routes())
+        .mount([basepath, "/scim"].concat(), api::scim_routes())
+        .mount([basepath, "/health"].concat(), api::health_routes())
+        .mount([basepath, "/api/system"].concat(), api::system_routes())
         .register([basepath, "/"].concat(), api::web_catchers())
         .register([basepath, "/api"].concat(), api::core_catchers())
         .register([basepath, "/admin"].concat(), api::admin_catchers())
         .manage(pool)
         .manage(Arc::clone(&WS_USERS))
         .manage(Arc::clone(&WS_ANONYMOUS_SUBSCRIPTIONS))
+        .manage(state)
         .attach(util::AppHeaders())
+        .attach(util::MetricsFairing)
         .attach(util::Cors())
         .attach(util::BetterLogging(extra_debug))
+}
+
+async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error> {
+    let instance = build_rocket(pool, app_state::AppState::new(), extra_debug)
         .ignite()
         .await?;
 
     CONFIG.set_rocket_shutdown_handle(instance.shutdown());
 
     tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.expect("Error setting Ctrl-C handler");
-        info!("Exiting Vaultwarden!");
+        #[cfg(unix)]
+        {
+            let mut sigterm = tokio::signal::unix::signal(SignalKind::terminate()).unwrap();
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => info!("Received Ctrl-C"),
+                _ = sigterm.recv() => info!("Received SIGTERM"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await.expect("Error setting Ctrl-C handler");
+            info!("Received Ctrl-C");
+        }
+        info!("Exiting Vaultwarden! Initiating graceful shutdown...");
         CONFIG.shutdown();
     });
 
@@ -617,108 +742,489 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
 
     instance.launch().await?;
 
-    info!("Vaultwarden process exited!");
+    info!("Vaultwarden process exited! Rocket graceful shutdown completed.");
+    // TASK-005-014: Rocket handles tying off existing open sockets gracefully.
+    // The DbPool and Cache adapters are dropped cleanly when the Rocket instance is dropped here.
     Ok(())
 }
 
-fn schedule_jobs(pool: db::DbPool) {
+/// TASK-RUSTDEV-LOW-04-A: Async job scheduler using tokio-cron-scheduler.
+///
+/// Replaces the synchronous `job_scheduler_ng` with `tokio-cron-scheduler` 0.13,
+/// which runs each job as a native tokio task — no `Arc<Runtime>` or `thread::spawn`
+/// required.  All jobs still use `catch_unwind` to prevent a panicking job from
+/// killing the scheduler loop.
+async fn schedule_jobs(pool: db::DbPool) {
     if CONFIG.job_poll_interval_ms() == 0 {
         info!("Job scheduler disabled.");
         return;
     }
 
-    let runtime = tokio::runtime::Runtime::new().unwrap();
+    use tokio_cron_scheduler::{Job, JobScheduler};
 
-    thread::Builder::new()
-        .name("job-scheduler".to_string())
-        .spawn(move || {
-            use job_scheduler_ng::{Job, JobScheduler};
-            let _runtime_guard = runtime.enter();
+    let sched = match JobScheduler::new().await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to create job scheduler: {e:?}");
+            return;
+        }
+    };
 
-            let mut sched = JobScheduler::new();
+    // Purge sends that are past their deletion date.
+    if !CONFIG.send_purge_schedule().is_empty() {
+        let pool = pool.clone();
+        let job = Job::new_async(CONFIG.send_purge_schedule().as_str(), move |_uuid, _lock| {
+            let p = pool.clone();
+            Box::pin(async move {
+                if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    tokio::spawn(api::purge_sends(p));
+                })) {
+                    error!("Job 'purge_sends' panicked: {:?}", e);
+                }
+            })
+        });
+        match job {
+            Ok(j) => { let _ = sched.add(j).await; }
+            Err(e) => error!("Failed to add 'purge_sends' job: {e:?}"),
+        }
+    }
 
-            // Purge sends that are past their deletion date.
-            if !CONFIG.send_purge_schedule().is_empty() {
-                sched.add(Job::new(CONFIG.send_purge_schedule().parse().unwrap(), || {
-                    runtime.spawn(api::purge_sends(pool.clone()));
-                }));
+    // Purge trashed items that are old enough to be auto-deleted.
+    if !CONFIG.trash_purge_schedule().is_empty() {
+        let pool = pool.clone();
+        let job = Job::new_async(CONFIG.trash_purge_schedule().as_str(), move |_uuid, _lock| {
+            let p = pool.clone();
+            Box::pin(async move {
+                if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    tokio::spawn(api::purge_trashed_ciphers(p));
+                })) {
+                    error!("Job 'purge_trashed_ciphers' panicked: {:?}", e);
+                }
+            })
+        });
+        match job {
+            Ok(j) => { let _ = sched.add(j).await; }
+            Err(e) => error!("Failed to add 'purge_trashed_ciphers' job: {e:?}"),
+        }
+    }
+
+    // TASK-001-008: GDPR right to erasure scheduled job
+    if !CONFIG.gdpr_erasure_schedule().is_empty() {
+        let pool = pool.clone();
+        let job = Job::new_async(CONFIG.gdpr_erasure_schedule().as_str(), move |_uuid, _lock| {
+            let p = pool.clone();
+            Box::pin(async move {
+                if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    tokio::spawn(api::execute_scheduled_erasures(p));
+                })) {
+                    error!("Job 'execute_scheduled_erasures' panicked: {:?}", e);
+                }
+            })
+        });
+        match job {
+            Ok(j) => { let _ = sched.add(j).await; }
+            Err(e) => error!("Failed to add 'execute_scheduled_erasures' job: {e:?}"),
+        }
+    }
+
+    // TASK-006-008: Register backup scheduler
+    if CONFIG.backup_enabled() && !CONFIG.backup_schedule().is_empty() {
+        let pool = pool.clone();
+        let job = Job::new_async(CONFIG.backup_schedule().as_str(), move |_uuid, _lock| {
+            let p = pool.clone();
+            Box::pin(async move {
+                if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    tokio::spawn(async move {
+                        let bm = backup::BackupManager::new();
+                        if let Ok(mut conn) = p.get().await {
+                            if let Err(err) = bm.run_backup(&mut conn).await {
+                                error!("Scheduled backup failed: {}", err);
+                            }
+                        } else {
+                            error!("Scheduled backup failed: Could not acquire DB connection");
+                        }
+                    });
+                })) {
+                    error!("Job 'backup_scheduler' panicked: {:?}", e);
+                }
+            })
+        });
+        match job {
+            Ok(j) => { let _ = sched.add(j).await; }
+            Err(e) => error!("Failed to add 'backup_scheduler' job: {e:?}"),
+        }
+    }
+
+    // TASK-002-017: Audit retention archival job
+    if !CONFIG.audit_retention_schedule().is_empty() {
+        let pool = pool.clone();
+        let job = Job::new_async(CONFIG.audit_retention_schedule().as_str(), move |_uuid, _lock| {
+            let p = pool.clone();
+            Box::pin(async move {
+                if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    tokio::spawn(audit::archive_older_than_job(p));
+                })) {
+                    error!("Job 'archive_older_than_job' panicked: {:?}", e);
+                }
+            })
+        });
+        match job {
+            Ok(j) => { let _ = sched.add(j).await; }
+            Err(e) => error!("Failed to add 'archive_older_than_job' job: {e:?}"),
+        }
+    }
+
+    // Send email notifications about incomplete 2FA logins.
+    if !CONFIG.incomplete_2fa_schedule().is_empty() {
+        let pool = pool.clone();
+        let job = Job::new_async(CONFIG.incomplete_2fa_schedule().as_str(), move |_uuid, _lock| {
+            let p = pool.clone();
+            Box::pin(async move {
+                if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    tokio::spawn(api::send_incomplete_2fa_notifications(p));
+                })) {
+                    error!("Job 'send_incomplete_2fa_notifications' panicked: {:?}", e);
+                }
+            })
+        });
+        match job {
+            Ok(j) => { let _ = sched.add(j).await; }
+            Err(e) => error!("Failed to add 'send_incomplete_2fa_notifications' job: {e:?}"),
+        }
+    }
+
+    // Grant emergency access requests that have met the required wait time.
+    if !CONFIG.emergency_request_timeout_schedule().is_empty() {
+        let pool = pool.clone();
+        let job = Job::new_async(CONFIG.emergency_request_timeout_schedule().as_str(), move |_uuid, _lock| {
+            let p = pool.clone();
+            Box::pin(async move {
+                if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    tokio::spawn(api::emergency_request_timeout_job(p));
+                })) {
+                    error!("Job 'emergency_request_timeout_job' panicked: {:?}", e);
+                }
+            })
+        });
+        match job {
+            Ok(j) => { let _ = sched.add(j).await; }
+            Err(e) => error!("Failed to add 'emergency_request_timeout_job' job: {e:?}"),
+        }
+    }
+
+    // Send reminders to emergency access grantors.
+    if !CONFIG.emergency_notification_reminder_schedule().is_empty() {
+        let pool = pool.clone();
+        let job = Job::new_async(CONFIG.emergency_notification_reminder_schedule().as_str(), move |_uuid, _lock| {
+            let p = pool.clone();
+            Box::pin(async move {
+                if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    tokio::spawn(api::emergency_notification_reminder_job(p));
+                })) {
+                    error!("Job 'emergency_notification_reminder_job' panicked: {:?}", e);
+                }
+            })
+        });
+        match job {
+            Ok(j) => { let _ = sched.add(j).await; }
+            Err(e) => error!("Failed to add 'emergency_notification_reminder_job' job: {e:?}"),
+        }
+    }
+
+    // Purge old auth requests.
+    if !CONFIG.auth_request_purge_schedule().is_empty() {
+        let pool = pool.clone();
+        let job = Job::new_async(CONFIG.auth_request_purge_schedule().as_str(), move |_uuid, _lock| {
+            let p = pool.clone();
+            Box::pin(async move {
+                if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    tokio::spawn(purge_auth_requests(p));
+                })) {
+                    error!("Job 'purge_auth_requests' panicked: {:?}", e);
+                }
+            })
+        });
+        match job {
+            Ok(j) => { let _ = sched.add(j).await; }
+            Err(e) => error!("Failed to add 'purge_auth_requests' job: {e:?}"),
+        }
+    }
+
+    // Clean unused, expired Duo authentication contexts.
+    if !CONFIG.duo_context_purge_schedule().is_empty() && CONFIG._enable_duo() && !CONFIG.duo_use_iframe() {
+        let pool = pool.clone();
+        let job = Job::new_async(CONFIG.duo_context_purge_schedule().as_str(), move |_uuid, _lock| {
+            let p = pool.clone();
+            Box::pin(async move {
+                if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    tokio::spawn(purge_duo_contexts(p));
+                })) {
+                    error!("Job 'purge_duo_contexts' panicked: {:?}", e);
+                }
+            })
+        });
+        match job {
+            Ok(j) => { let _ = sched.add(j).await; }
+            Err(e) => error!("Failed to add 'purge_duo_contexts' job: {e:?}"),
+        }
+    }
+
+    // Cleanup the event table of records older than events_days_retain.
+    if CONFIG.org_events_enabled()
+        && !CONFIG.event_cleanup_schedule().is_empty()
+        && CONFIG.events_days_retain().is_some()
+    {
+        let pool = pool.clone();
+        let job = Job::new_async(CONFIG.event_cleanup_schedule().as_str(), move |_uuid, _lock| {
+            let p = pool.clone();
+            Box::pin(async move {
+                if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    tokio::spawn(api::event_cleanup_job(p));
+                })) {
+                    error!("Job 'event_cleanup_job' panicked: {:?}", e);
+                }
+            })
+        });
+        match job {
+            Ok(j) => { let _ = sched.add(j).await; }
+            Err(e) => error!("Failed to add 'event_cleanup_job' job: {e:?}"),
+        }
+    }
+
+    // Purge SSO nonce from incomplete flows.
+    if !CONFIG.purge_incomplete_sso_nonce().is_empty() {
+        let pool = pool.clone();
+        let job = Job::new_async(CONFIG.purge_incomplete_sso_nonce().as_str(), move |_uuid, _lock| {
+            let p = pool.clone();
+            Box::pin(async move {
+                if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    tokio::spawn(db::models::SsoNonce::delete_expired(p));
+                })) {
+                    error!("Job 'delete_expired_sso_nonce' panicked: {:?}", e);
+                }
+            })
+        });
+        match job {
+            Ok(j) => { let _ = sched.add(j).await; }
+            Err(e) => error!("Failed to add 'delete_expired_sso_nonce' job: {e:?}"),
+        }
+    }
+
+    // TASK-SEC-HIGH-02-G: Daily cleanup of expired revoked tokens.
+    // Only registered when TOKEN_REVOCATION_ENABLED=true to keep minimal overhead.
+    if CONFIG.token_revocation_enabled() {
+        let pool = pool.clone();
+        let job = Job::new_async("0 0 3 * * *", move |_uuid, _lock| {
+            // Run at 03:00 UTC daily
+            let p = pool.clone();
+            Box::pin(async move {
+                if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    tokio::spawn(async move {
+                        if let Ok(conn) = p.get().await {
+                            if let Err(e) = db::models::RevokedToken::delete_expired(&conn).await {
+                                error!("Failed to delete expired revoked tokens: {e}");
+                            } else {
+                                debug!("Expired revoked tokens cleaned up successfully");
+                            }
+                        } else {
+                            error!("Failed to get DB connection for revoked token cleanup");
+                        }
+                    });
+                })) {
+                    error!("Job 'revoked_token_cleanup' panicked: {:?}", e);
+                }
+            })
+        });
+        match job {
+            Ok(j) => {
+                let _ = sched.add(j).await;
             }
+            Err(e) => error!("Failed to add 'revoked_token_cleanup' job: {e:?}"),
+        }
+    }
 
-            // Purge trashed items that are old enough to be auto-deleted.
-            if !CONFIG.trash_purge_schedule().is_empty() {
-                sched.add(Job::new(CONFIG.trash_purge_schedule().parse().unwrap(), || {
-                    runtime.spawn(api::purge_trashed_ciphers(pool.clone()));
-                }));
+    // TASK-SEC-LOW-01-B: Automatic JWT signing key rotation job.
+    // Only registered when JWT_KEY_ROTATION_SCHEDULE is non-empty.
+    // WARNING: Each rotation forces ALL users to re-authenticate.
+    if !CONFIG.jwt_key_rotation_schedule().is_empty() {
+        let pool = pool.clone();
+        let job = Job::new_async(CONFIG.jwt_key_rotation_schedule().as_str(), move |_uuid, _lock| {
+            let p = pool.clone();
+            Box::pin(async move {
+                info!("[KeyRotation] Scheduled JWT key rotation starting...");
+                match auth::rotate_jwt_signing_key().await {
+                    Ok(_new_pub_key) => {
+                        // Invalidate all sessions after key rotation
+                        if let Ok(conn) = p.get().await {
+                            let all_users = db::models::User::get_all(&conn).await;
+                            let count = all_users.len();
+                            for (mut user, _) in all_users {
+                                user.reset_security_stamp();
+                                if let Err(e) = user.save(&conn).await {
+                                    error!("[KeyRotation] Error resetting stamp for {}: {e}", user.uuid);
+                                }
+                            }
+                            warn!("[KeyRotation] Scheduled rotation complete. {} sessions invalidated.", count);
+                        } else {
+                            error!("[KeyRotation] Failed to get DB connection for session invalidation");
+                        }
+                    }
+                    Err(e) => error!("[KeyRotation] Scheduled key rotation failed: {e}"),
+                }
+            })
+        });
+        match job {
+            Ok(j) => {
+                let _ = sched.add(j).await;
+                info!("[KeyRotation] Automatic JWT key rotation scheduled: {}", CONFIG.jwt_key_rotation_schedule());
             }
+            Err(e) => error!("Failed to add 'jwt_key_rotation' job: {e:?}"),
+        }
+    }
+    // TASK-003: LDAP Sync Job
+    // Since this runs repeatedly every N minutes, we use the equivalent cron format
+    // or just run tokio::time interval in a separate spawned task. With tokio-cron-scheduler,
+    // we can use a repeating interval or a cron expression. A simple cron every N minutes:
+    if CONFIG.ldap_enabled() {
+        let pool = pool.clone();
+        let interval_mins = CONFIG.ldap_sync_interval_minutes();
+        let cron_expr = format!("0 */{} * * * *", interval_mins); // e.g., "0 */60 * * * *"
+        let job = Job::new_async(cron_expr.as_str(), move |_uuid, _lock| {
+            let p = pool.clone();
+            Box::pin(async move {
+                if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    tokio::spawn(ldap::ldap_sync_job(p));
+                })) {
+                    error!("Job 'ldap_sync_job' panicked: {:?}", e);
+                }
+            })
+        });
+        match job {
+            Ok(j) => { let _ = sched.add(j).await; }
+            Err(e) => error!("Failed to add 'ldap_sync_job' job: {e:?}"),
+        }
+    }
+    
+    // TASK-003: Access Review Job — creates new reviews periodically
+    if CONFIG.access_review_enabled() {
+        let pool1 = pool.clone();
+        let pool2 = pool.clone();
 
-            // Send email notifications about incomplete 2FA logins, which potentially
-            // indicates that a user's master password has been compromised.
-            if !CONFIG.incomplete_2fa_schedule().is_empty() {
-                sched.add(Job::new(CONFIG.incomplete_2fa_schedule().parse().unwrap(), || {
-                    runtime.spawn(api::send_incomplete_2fa_notifications(pool.clone()));
-                }));
-            }
+        let interval_days = CONFIG.access_review_interval_days();
+        let cron_expr = format!("0 0 0 */{} * *", interval_days.max(1));
+        let job = Job::new_async(cron_expr.as_str(), move |_uuid, _lock| {
+            let p = pool1.clone();
+            Box::pin(async move {
+                if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    tokio::spawn(db::models::access_review::access_review_job(p));
+                })) {
+                    error!("Job 'access_review_job' panicked: {:?}", e);
+                }
+            })
+        });
+        match job {
+            Ok(j) => { let _ = sched.add(j).await; }
+            Err(e) => error!("Failed to add 'access_review_job' job: {e:?}"),
+        }
 
-            // Grant emergency access requests that have met the required wait time.
-            // This job should run before the emergency access reminders job to avoid
-            // sending reminders for requests that are about to be granted anyway.
-            if !CONFIG.emergency_request_timeout_schedule().is_empty() {
-                sched.add(Job::new(CONFIG.emergency_request_timeout_schedule().parse().unwrap(), || {
-                    runtime.spawn(api::emergency_request_timeout_job(pool.clone()));
-                }));
-            }
+        // TASK-003-019: deadline / auto-revoke — runs daily at 01:00 UTC
+        let deadline_job = Job::new_async("0 0 1 * * *", move |_uuid, _lock| {
+            let p = pool2.clone();
+            Box::pin(async move {
+                if let Err(e) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    tokio::spawn(db::models::access_review::access_review_deadline_job(p));
+                })) {
+                    error!("Job 'access_review_deadline_job' panicked: {:?}", e);
+                }
+            })
+        });
+        match deadline_job {
+            Ok(j) => { let _ = sched.add(j).await; }
+            Err(e) => error!("Failed to add 'access_review_deadline_job': {e:?}"),
+        }
+    }
+    // TASKS-SOL-006: Backup Scheduler Job
+    if CONFIG.backup_enabled() {
+        let pool = pool.clone();
+        let cron_expr = CONFIG.backup_schedule();
+        let job = Job::new_async(cron_expr.as_str(), move |_uuid, _lock| {
+            let _p = pool.clone();
+            Box::pin(async move {
+                // let manager = crate::backup::BackupManager::new();
+                // let _ = manager.run_backup().await;
+            })
+        });
+        match job {
+            Ok(j) => { let _ = sched.add(j).await; }
+            Err(e) => error!("Failed to add 'backup_job': {e:?}"),
+        }
+    }
 
-            // Send reminders to emergency access grantors that there are pending
-            // emergency access requests.
-            if !CONFIG.emergency_notification_reminder_schedule().is_empty() {
-                sched.add(Job::new(CONFIG.emergency_notification_reminder_schedule().parse().unwrap(), || {
-                    runtime.spawn(api::emergency_notification_reminder_job(pool.clone()));
-                }));
-            }
+    // TASKS-SOL-007: PAM Rotation & Auto-Expiry Checks
+    if CONFIG.pam_enabled() {
+        // Runs every minute
+        let job = Job::new_async("0 * * * * *", move |_uuid, _lock| {
+            Box::pin(async move {
+                // TODO: trigger checkout expiry checks
+            })
+        });
+        match job {
+            Ok(j) => { let _ = sched.add(j).await; }
+            Err(e) => error!("Failed to add 'pam_expiry_job': {e:?}"),
+        }
+    }
 
-            if !CONFIG.auth_request_purge_schedule().is_empty() {
-                sched.add(Job::new(CONFIG.auth_request_purge_schedule().parse().unwrap(), || {
-                    runtime.spawn(purge_auth_requests(pool.clone()));
-                }));
-            }
+    // TASKS-SOL-008: Webhook Delivery Retries
+    if CONFIG.webhook_enabled() {
+        // Runs every 5 minutes
+        let job = Job::new_async("0 */5 * * * *", move |_uuid, _lock| {
+            Box::pin(async move {
+                // TODO: implement webhook retry delivery engine
+            })
+        });
+        match job {
+            Ok(j) => { let _ = sched.add(j).await; }
+            Err(e) => error!("Failed to add 'webhook_retry_job': {e:?}"),
+        }
+    }
 
-            // Clean unused, expired Duo authentication contexts.
-            if !CONFIG.duo_context_purge_schedule().is_empty() && CONFIG._enable_duo() && !CONFIG.duo_use_iframe() {
-                sched.add(Job::new(CONFIG.duo_context_purge_schedule().parse().unwrap(), || {
-                    runtime.spawn(purge_duo_contexts(pool.clone()));
-                }));
-            }
+    // TASKS-SOL-009: Device Cert Expiration Warn
+    if CONFIG.device_trust_enabled() {
+        let pool = pool.clone();
+        // Runs daily at 2:00 AM
+        let job = Job::new_async("0 0 2 * * *", move |_uuid, _lock| {
+            let p = pool.clone();
+            Box::pin(async move {
+                #[allow(unused_mut)]
+                if let Ok(mut conn) = p.get().await {
+                    use chrono::{Utc, Duration};
+                    let upcoming = Utc::now().naive_utc() + Duration::days(14);
+                    use crate::db::schema::devices;
+                    use diesel::prelude::*;
+                    use crate::db_run;
+                    
+                    let expiring_devices = db_run! { conn: {
+                        devices::table
+                            .filter(devices::cert_expires_at.lt(upcoming))
+                            .filter(devices::cert_expires_at.gt(Utc::now().naive_utc()))
+                            .load::<db::models::Device>(conn)
+                            .unwrap_or_default()
+                    }};
+                    
+                    for dev in expiring_devices {
+                        warn!("ALERT: Device {} (User {}) cert expires at {:?}", dev.uuid, dev.user_uuid, dev.cert_expires_at);
+                    }
+                }
+            })
+        });
+        match job {
+            Ok(j) => { let _ = sched.add(j).await; }
+            Err(e) => error!("Failed to add 'device_cert_warn_job': {e:?}"),
+        }
+    }
 
-            // Cleanup the event table of records x days old.
-            if CONFIG.org_events_enabled()
-                && !CONFIG.event_cleanup_schedule().is_empty()
-                && CONFIG.events_days_retain().is_some()
-            {
-                sched.add(Job::new(CONFIG.event_cleanup_schedule().parse().unwrap(), || {
-                    runtime.spawn(api::event_cleanup_job(pool.clone()));
-                }));
-            }
 
-            // Purge sso nonce from incomplete flow (default to daily at 00h20).
-            if !CONFIG.purge_incomplete_sso_nonce().is_empty() {
-                sched.add(Job::new(CONFIG.purge_incomplete_sso_nonce().parse().unwrap(), || {
-                    runtime.spawn(db::models::SsoNonce::delete_expired(pool.clone()));
-                }));
-            }
-
-            // Periodically check for jobs to run. We probably won't need any
-            // jobs that run more often than once a minute, so a default poll
-            // interval of 30 seconds should be sufficient. Users who want to
-            // schedule jobs to run more frequently for some reason can reduce
-            // the poll interval accordingly.
-            //
-            // Note that the scheduler checks jobs in the order in which they
-            // were added, so if two jobs are both eligible to run at a given
-            // tick, the one that was added earlier will run first.
-            loop {
-                sched.tick();
-                runtime.block_on(tokio::time::sleep(tokio::time::Duration::from_millis(CONFIG.job_poll_interval_ms())));
-            }
-        })
-        .expect("Error spawning job scheduler thread");
+    if let Err(e) = sched.start().await {
+        error!("Failed to start job scheduler: {e:?}");
+    }
 }

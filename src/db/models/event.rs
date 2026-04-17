@@ -34,6 +34,7 @@ pub struct Event {
     pub provider_uuid: Option<String>,
     pub provider_user_uuid: Option<String>,
     pub provider_org_uuid: Option<String>,
+    pub tenant_uuid: String,
 }
 
 // Upstream enum: https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Core/AdminConsole/Enums/EventType.cs
@@ -159,6 +160,7 @@ impl Event {
             provider_uuid: None,
             provider_user_uuid: None,
             provider_org_uuid: None,
+            tenant_uuid: CONFIG.tenant_default_uuid(),
         }
     }
 
@@ -335,6 +337,59 @@ impl Event {
         } else {
             Ok(())
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // TASK-011-009: Tenant-aware (_ctx) query variants — SOL-011 Multi-Tenancy
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Find events for an organization, additionally scoped to the current tenant context.
+    /// Prevents cross-tenant event log leakage by validating tenant_uuid on the event row.
+    pub async fn find_by_organization_uuid_ctx(
+        org_uuid: &OrganizationId,
+        start: &NaiveDateTime,
+        end: &NaiveDateTime,
+        ctx: &crate::tenant::TenantContext,
+        conn: &DbConn,
+    ) -> Vec<Self> {
+        use crate::tenant::TenantContext;
+        match ctx {
+            TenantContext::SingleInstance | TenantContext::SystemAdmin => {
+                Self::find_by_organization_uuid(org_uuid, start, end, conn).await
+            }
+            TenantContext::Tenant(tenant_uuid) => {
+                let tid = tenant_uuid.clone();
+                db_run! { conn: {
+                    event::table
+                        .filter(event::org_uuid.eq(org_uuid))
+                        .filter(event::event_date.between(start, end))
+                        .filter(event::tenant_uuid.eq(tid))
+                        .order_by(event::event_date.desc())
+                        .limit(Self::PAGE_SIZE)
+                        .load::<Self>(conn)
+                        .expect("Error filtering tenant events")
+                }}
+            }
+        }
+    }
+
+    /// Find all events for a specific tenant (used by the system admin API for audit log export).
+    pub async fn find_by_tenant(
+        tenant_uuid: &str,
+        start: &NaiveDateTime,
+        end: &NaiveDateTime,
+        conn: &DbConn,
+    ) -> Vec<Self> {
+        let tid = tenant_uuid.to_string();
+        db_run! { conn: {
+            event::table
+                .filter(event::tenant_uuid.eq(tid))
+                .filter(event::event_date.between(start, end))
+                .order_by(event::event_date.desc())
+                .limit(Self::PAGE_SIZE)
+                .load::<Self>(conn)
+                .expect("Error loading tenant audit events")
+        }}
     }
 }
 

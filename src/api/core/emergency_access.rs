@@ -465,14 +465,31 @@ async fn initiate_emergency_access(emer_id: EmergencyAccessId, headers: Headers,
     emergency_access.save(&conn).await?;
 
     if CONFIG.mail_enabled() {
-        mail::send_emergency_access_recovery_initiated(
+        if let Err(e) = mail::send_emergency_access_recovery_initiated(
             &grantor_user.email,
             &initiating_user.name,
             emergency_access.get_type_as_str(),
             &emergency_access.wait_time_days,
         )
-        .await?;
+        .await
+        {
+            warn!("Failed to send emergency access initiation email to grantor: {e}");
+        }
     }
+
+    // TASK-SEC-MED-03-A: Push in-app notification to grantor as backup channel.
+    // Use SyncVault so the grantor's client refreshes and shows the pending emergency access.
+    // Non-blocking: if push is unavailable (e.g., push relay down), log warn but succeed.
+    if let Some(grantor) = User::find_by_uuid(&emergency_access.grantor_uuid, &conn).await {
+        use crate::api::push::push_user_update;
+        use crate::api::UpdateType;
+        push_user_update(UpdateType::SyncVault, &grantor, &None, &conn).await;
+        info!(
+            "[EmergencyAccess] Sent SyncVault push to grantor {} after recovery initiation by {}",
+            grantor.email, initiating_user.email
+        );
+    }
+
     Ok(Json(emergency_access.to_json()))
 }
 
@@ -784,43 +801,78 @@ pub async fn emergency_notification_reminder_job(pool: DbPool) {
         }
 
         let now = Utc::now().naive_utc();
+
+        // TASK-SEC-MED-03-B: Multi-tier reminder schedule T-7, T-3, T-1.
+        // The reminder is sent when the time until expiry crosses one of these thresholds
+        // AND at least 20 hours have passed since the last notification (de-duplication guard).
+        const REMINDER_DAYS: [i64; 3] = [7, 3, 1];
+        const DEDUP_HOURS: i64 = 20;
+
         for mut emer in emergency_access_list {
-            // The find_all_recoveries_initiated already checks if the recovery_initiated_at is not null (None)
-            // Calculate the day before the recovery will become active
-            let final_recovery_reminder_at =
-                emer.recovery_initiated_at.unwrap() + TimeDelta::try_days(i64::from(emer.wait_time_days - 1)).unwrap();
-            // Calculate if a day has passed since the previous notification, else no notification has been sent before
-            let next_recovery_reminder_at = if let Some(last_notification_at) = emer.last_notification_at {
-                last_notification_at + TimeDelta::try_days(1).unwrap()
-            } else {
-                now
+            let recovery_initiated_at = match emer.recovery_initiated_at {
+                Some(t) => t,
+                None => continue, // Should not happen but guard anyway
             };
-            if final_recovery_reminder_at.le(&now) && next_recovery_reminder_at.le(&now) {
-                // Only update the last notification date
-                // Updating the whole record could cause issues when the emergency_request_timeout_job is also active
-                emer.update_last_notification_date_and_save(&now, &conn)
+
+            let recovery_active_at =
+                recovery_initiated_at + TimeDelta::try_days(i64::from(emer.wait_time_days)).unwrap();
+
+            // Days remaining until the recovery window opens (may be negative = already open)
+            let days_remaining = (recovery_active_at - now).num_days();
+
+            // Check if now is beyond the next reminder threshold
+            let should_notify = REMINDER_DAYS.iter().any(|&threshold| {
+                // We want to notify when days_remaining <= threshold
+                // i.e., the waiting window is within `threshold` days of completing.
+                days_remaining <= threshold
+            });
+
+            if !should_notify {
+                continue;
+            }
+
+            // De-duplication: skip if we already notified within the last 20h
+            let dedup_cutoff = now - TimeDelta::try_hours(DEDUP_HOURS).unwrap();
+            if let Some(last_notified) = emer.last_notification_at {
+                if last_notified.ge(&dedup_cutoff) {
+                    continue;
+                }
+            }
+
+            // Determine which tier we are in (use the smallest matching threshold)
+            let tier_label = REMINDER_DAYS
+                .iter()
+                .find(|&&t| days_remaining <= t)
+                .map(|&t| t.to_string())
+                .unwrap_or_else(|| days_remaining.max(0).to_string());
+
+            // Update last notification timestamp first (before sending) to avoid
+            // double-sending if the mail step below fails and the job re-runs.
+            emer.update_last_notification_date_and_save(&now, &conn)
+                .await
+                .expect("Unable to update emergency access notification date");
+
+            if CONFIG.mail_enabled() {
+                let grantor_user = User::find_by_uuid(&emer.grantor_uuid, &conn).await.expect("Grantor user not found");
+
+                let grantee_user = User::find_by_uuid(&emer.grantee_uuid.clone().expect("Grantee user invalid"), &conn)
                     .await
-                    .expect("Unable to update emergency access notification date");
+                    .expect("Grantee user not found");
 
-                if CONFIG.mail_enabled() {
-                    // get grantor user to send Accepted email
-                    let grantor_user =
-                        User::find_by_uuid(&emer.grantor_uuid, &conn).await.expect("Grantor user not found");
+                info!(
+                    "[EmergencyAccess] Sending T-{} reminder to grantor {} (access by {})",
+                    tier_label, grantor_user.email, grantee_user.name
+                );
 
-                    // get grantee user to send Accepted email
-                    let grantee_user =
-                        User::find_by_uuid(&emer.grantee_uuid.clone().expect("Grantee user invalid"), &conn)
-                            .await
-                            .expect("Grantee user not found");
-
-                    mail::send_emergency_access_recovery_reminder(
-                        &grantor_user.email,
-                        &grantee_user.name,
-                        emer.get_type_as_str(),
-                        "1", // This notification is only triggered one day before the activation
-                    )
-                    .await
-                    .expect("Error on sending email");
+                if let Err(e) = mail::send_emergency_access_recovery_reminder(
+                    &grantor_user.email,
+                    &grantee_user.name,
+                    emer.get_type_as_str(),
+                    &tier_label,
+                )
+                .await
+                {
+                    error!("[EmergencyAccess] Failed to send T-{tier_label} reminder email: {e}");
                 }
             }
         }

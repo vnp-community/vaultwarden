@@ -2,7 +2,7 @@ use std::{
     fmt,
     net::{IpAddr, SocketAddr},
     str::FromStr,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 
@@ -82,20 +82,38 @@ fn should_block_address_regex(domain_or_ip: &str) -> bool {
         return false;
     };
 
-    static COMPILED_REGEX: Mutex<Option<(String, Regex)>> = Mutex::new(None);
-    let mut guard = COMPILED_REGEX.lock().unwrap();
+    // TASK-RUSTDEV-HIGH-01: ArcSwap gives lock-free reads on the hot path.
+    // The write path (regex compile on config change) uses a separate Mutex
+    // only to serialise concurrent writers, not concurrent readers.
+    use arc_swap::ArcSwap;
+    use std::sync::Mutex as WriteMutex;
 
-    // If the stored regex is up to date, use it
-    if let Some((value, regex)) = &*guard {
+    static COMPILED_REGEX: LazyLock<ArcSwap<Option<(String, Regex)>>> =
+        LazyLock::new(|| ArcSwap::from_pointee(None));
+    static WRITE_LOCK: WriteMutex<()> = WriteMutex::new(());
+
+    // Fast path: lock-free load, O(1) Arc clone
+    let current = COMPILED_REGEX.load();
+    if let Some((value, regex)) = current.as_ref().as_ref() {
         if value == &block_regex {
             return regex.is_match(domain_or_ip);
         }
     }
 
-    // If we don't have a regex stored, or it's not up to date, recreate it
+    // Slow path: recompile regex; serialise writers but don't block readers
+    let _guard = WRITE_LOCK.lock().unwrap();
+
+    // Double-check after acquiring write lock
+    let current = COMPILED_REGEX.load();
+    if let Some((value, regex)) = current.as_ref().as_ref() {
+        if value == &block_regex {
+            return regex.is_match(domain_or_ip);
+        }
+    }
+
     let regex = Regex::new(&block_regex).unwrap();
     let is_match = regex.is_match(domain_or_ip);
-    *guard = Some((block_regex, regex));
+    COMPILED_REGEX.store(Arc::new(Some((block_regex, regex))));
 
     is_match
 }
@@ -199,20 +217,25 @@ impl CustomDnsResolver {
         }
     }
 
-    // Note that we get an iterator of addresses, but we only grab the first one for convenience
+    // TASK-SEC-HIGH-03-B: DNS rebinding prevention.
+    // Collect ALL resolved IPs and reject the connection if *any* of them are non-global.
+    // The original code only checked the first IP (.next()), which is exploitable via DNS
+    // rebinding: attacker serves a global IP on first resolve, then switches to an internal
+    // IP on the actual TCP connection.
     async fn resolve_domain(&self, name: &str) -> Result<Option<SocketAddr>, BoxError> {
         pre_resolve(name)?;
 
-        let result = match self {
-            Self::Default() => tokio::net::lookup_host(name).await?.next(),
-            Self::Hickory(r) => r.lookup_ip(name).await?.iter().next().map(|a| SocketAddr::new(a, 0)),
+        let addrs: Vec<SocketAddr> = match self {
+            Self::Default() => tokio::net::lookup_host(name).await?.collect(),
+            Self::Hickory(r) => r.lookup_ip(name).await?.iter().map(|a| SocketAddr::new(a, 0)).collect(),
         };
 
-        if let Some(addr) = &result {
+        // Reject if ANY resolved IP is non-global (DNS rebinding defence)
+        for addr in &addrs {
             post_resolve(name, addr.ip())?;
         }
 
-        Ok(result)
+        Ok(addrs.into_iter().next())
     }
 }
 

@@ -9,6 +9,8 @@ use rocket::{
 };
 use serde_json::Value;
 
+use rocket::State;
+
 use crate::{
     api::{
         core::{
@@ -20,6 +22,7 @@ use crate::{
         push::register_push_device,
         ApiResult, EmptyResult, JsonResult,
     },
+    app_state::{AppState, RateLimiter},
     auth,
     auth::{generate_organization_api_key_login_claims, AuthMethod, ClientHeaders, ClientIp, ClientVersion},
     db::{
@@ -54,16 +57,20 @@ async fn login(
     data: Form<ConnectData>,
     client_header: ClientHeaders,
     client_version: Option<ClientVersion>,
-    conn: DbConn,
+    cert_info: crate::device_trust::DeviceCertInfo,
+    state: &State<AppState>,
+    mut conn: DbConn,
 ) -> JsonResult {
     let data: ConnectData = data.into_inner();
+    // MED-03-C: use injected rate limiter instead of calling global check_limit_login directly.
+    let limiter = state.rate_limiter.as_ref();
 
     let mut user_id: Option<UserId> = None;
 
-    let login_result = match data.grant_type.as_ref() {
+    let mut login_result = match data.grant_type.as_ref() {
         "refresh_token" => {
             _check_is_some(&data.refresh_token, "refresh_token cannot be blank")?;
-            _refresh_login(data, &conn, &client_header.ip).await
+            _refresh_login(data.clone(), &conn, &client_header.ip).await
         }
         "password" if CONFIG.sso_enabled() && CONFIG.sso_only() => err!("SSO sign-in is required"),
         "password" => {
@@ -76,7 +83,7 @@ async fn login(
             _check_is_some(&data.device_name, "device_name cannot be blank")?;
             _check_is_some(&data.device_type, "device_type cannot be blank")?;
 
-            _password_login(data, &mut user_id, &conn, &client_header.ip, &client_version).await
+            _password_login(data.clone(), &mut user_id, &conn, &client_header.ip, &client_version, limiter).await
         }
         "client_credentials" => {
             _check_is_some(&data.client_id, "client_id cannot be blank")?;
@@ -87,7 +94,7 @@ async fn login(
             _check_is_some(&data.device_name, "device_name cannot be blank")?;
             _check_is_some(&data.device_type, "device_type cannot be blank")?;
 
-            _api_key_login(data, &mut user_id, &conn, &client_header.ip).await
+            _api_key_login(data.clone(), &mut user_id, &conn, &client_header.ip, limiter).await
         }
         "authorization_code" if CONFIG.sso_enabled() => {
             _check_is_some(&data.client_id, "client_id cannot be blank")?;
@@ -97,15 +104,72 @@ async fn login(
             _check_is_some(&data.device_name, "device_name cannot be blank")?;
             _check_is_some(&data.device_type, "device_type cannot be blank")?;
 
-            _sso_login(data, &mut user_id, &conn, &client_header.ip, &client_version).await
+            _sso_login(data.clone(), &mut user_id, &conn, &client_header.ip, &client_version, limiter).await
         }
         "authorization_code" => err!("SSO sign-in is not available"),
         t => err!("Invalid type", t),
     };
 
+    if let Some(ref user_uuid) = user_id {
+        if login_result.is_ok() {
+            if let Some(ref device_identifier) = data.device_identifier {
+                let device_id_str = device_identifier.to_string();
+                if !device_id_str.is_empty() && CONFIG.device_trust_enabled() {
+                    use crate::db::models::Membership;
+                    let memberships = Membership::find_confirmed_by_user(user_uuid, &conn).await;
+                    let mut denied_reason = None;
+                    
+                    for m in memberships {
+                        let decision = crate::device_trust::evaluate_device_trust(
+                            &cert_info, 
+                            &m.org_uuid, 
+                            &device_id_str, 
+                            &mut conn
+                        ).await;
+                        
+                        if let crate::device_trust::TrustDecision::Denied { reason } = decision {
+                            denied_reason = Some(reason);
+                            break;
+                        }
+                    }
+
+                    if let Some(reason) = denied_reason {
+                        login_result = Err(crate::error::Error::new("Device trust failed", &reason).with_code(Status::BadRequest.code));
+                    } else {
+                        use crate::db::models::Device;
+                        if let Some(mut device) = Device::find_by_uuid_and_user(
+                            device_identifier, 
+                            user_uuid, 
+                            &conn
+                        ).await {
+                            device.cert_subject = Some(cert_info.subject_dn.clone());
+                            device.cert_serial = Some(cert_info.serial.clone());
+                            if !cert_info.device_id.is_empty() {
+                                device.is_trusted = true;
+                            }
+                            device.save(&conn).await.ok();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if let Some(user_id) = user_id {
         match &login_result {
             Ok(_) => {
+                // TASK-010-007: Emit login success metrics
+                if CONFIG.metrics_enabled() {
+                    let grant = data.grant_type.as_str();
+                    crate::metrics::METRICS.login_attempts_total
+                        .get_or_create(&crate::metrics::LoginLabels {
+                            result: "success".to_string(),
+                            method: grant.to_string(),
+                        })
+                        .inc();
+                    crate::metrics::METRICS.active_sessions.inc();
+                }
+
                 log_user_event(
                     EventType::UserLoggedIn as i32,
                     &user_id,
@@ -114,12 +178,52 @@ async fn login(
                     &conn,
                 )
                 .await;
+
+                crate::audit::emit_audit_event(crate::audit::AuditEvent {
+                    event_type: crate::audit::AuditEventType::LoginSuccess,
+                    severity: "INFO".to_string(),
+                    actor_user_uuid: Some(user_id.to_string()),
+                    actor_email: data.username.clone(),
+                    target_resource: None,
+                    ip_address: Some(client_header.ip.ip.to_string()),
+                    user_agent: None,
+                    org_uuid: None,
+                    metadata: Some(format!("DeviceType: {}", client_header.device_type)),
+                }).await;
             }
             Err(e) => {
+                // TASK-010-007: Emit login failure metrics
+                if CONFIG.metrics_enabled() {
+                    let grant = data.grant_type.as_str();
+                    crate::metrics::METRICS.login_attempts_total
+                        .get_or_create(&crate::metrics::LoginLabels {
+                            result: "failure".to_string(),
+                            method: grant.to_string(),
+                        })
+                        .inc();
+                    crate::metrics::METRICS.failed_logins_total
+                        .get_or_create(&crate::metrics::LoginLabels {
+                            result: "failure".to_string(),
+                            method: grant.to_string(),
+                        })
+                        .inc();
+                }
                 if let Some(ev) = e.get_event() {
                     log_user_event(ev.event as i32, &user_id, client_header.device_type, &client_header.ip.ip, &conn)
                         .await
                 }
+
+                crate::audit::emit_audit_event(crate::audit::AuditEvent {
+                    event_type: crate::audit::AuditEventType::LoginFailed,
+                    severity: "WARN".to_string(),
+                    actor_user_uuid: Some(user_id.to_string()),
+                    actor_email: data.username.clone(),
+                    target_resource: None,
+                    ip_address: Some(client_header.ip.ip.to_string()),
+                    user_agent: None,
+                    org_uuid: None,
+                    metadata: Some(format!("Error: {}", e.message())),
+                }).await;
             }
         }
     }
@@ -149,9 +253,11 @@ async fn _refresh_login(data: ConnectData, conn: &DbConn, ip: &ClientIp) -> Json
             // Save to update `device.updated_at` to track usage and toggle new status
             device.save(conn).await?;
 
+            let refresh_token = auth_tokens.refresh_token()?;
+            let access_token = auth_tokens.access_token()?;
             let result = json!({
-                "refresh_token": auth_tokens.refresh_token(),
-                "access_token": auth_tokens.access_token(),
+                "refresh_token": refresh_token,
+                "access_token": access_token,
                 "expires_in": auth_tokens.expires_in(),
                 "token_type": "Bearer",
                 "scope": auth_tokens.scope(),
@@ -169,11 +275,12 @@ async fn _sso_login(
     conn: &DbConn,
     ip: &ClientIp,
     client_version: &Option<ClientVersion>,
+    limiter: &dyn RateLimiter,
 ) -> JsonResult {
     AuthMethod::Sso.check_scope(data.scope.as_ref())?;
 
-    // Ratelimit the login
-    crate::ratelimit::check_limit_login(&ip.ip)?;
+    // MED-03-C: rate limit via injected limiter (testable, no global dep)
+    limiter.check_login(&ip.ip).await?;
 
     let code = match data.code.as_ref() {
         None => err!(
@@ -229,6 +336,60 @@ async fn _sso_login(
                         event: EventType::UserFailedLogIn
                     }
                 );
+            }
+
+            // TASK-SEC-MED-02-C: Email domain restriction for SSO provisioning.
+            // Checked before group whitelist — cheaper and fails fast.
+            let required_domain = CONFIG.sso_require_email_domain();
+            if !required_domain.is_empty() {
+                let domain_suffix = format!("@{}", required_domain.trim_start_matches('@'));
+                if !user_infos.email.to_lowercase().ends_with(&domain_suffix.to_lowercase()) {
+                    error!(
+                        "SECURITY AUDIT [SsoProvisioningBlocked]: SSO user {} blocked — email domain \
+                         does not match SSO_REQUIRE_EMAIL_DOMAIN={}",
+                        user_infos.email, required_domain
+                    );
+                    err!(
+                        "SSO provisioning blocked: email domain not permitted",
+                        ErrorEvent {
+                            event: EventType::UserFailedLogIn
+                        }
+                    );
+                }
+            }
+
+            // TASK-SEC-MED-02-B: Group whitelist — only enforced when SIGNUPS_ALLOWED=false.
+            // When signups are open we allow all SSO users regardless of group.
+            if !CONFIG.signups_allowed() {
+                let allowed_groups_cfg = CONFIG.sso_allowed_groups();
+                if !allowed_groups_cfg.is_empty() {
+                    let allowed: std::collections::HashSet<String> = allowed_groups_cfg
+                        .split(',')
+                        .map(|g| g.trim().to_lowercase())
+                        .collect();
+
+                    // user_infos.groups is the groups claim from the IdP (may be empty vec if not present)
+                    let user_groups: std::collections::HashSet<String> = user_infos
+                        .groups
+                        .iter()
+                        .map(|g| g.to_lowercase())
+                        .collect();
+
+                    let has_allowed_group = user_groups.iter().any(|g| allowed.contains(g));
+                    if !has_allowed_group {
+                        error!(
+                            "SECURITY AUDIT [SsoProvisioningBlocked]: SSO user {} blocked — \
+                             not a member of any allowed group. User groups: {:?}",
+                            user_infos.email, user_groups
+                        );
+                        err!(
+                            "SSO provisioning blocked: user is not in an allowed group",
+                            ErrorEvent {
+                                event: EventType::UserFailedLogIn
+                            }
+                        );
+                    }
+                }
             }
 
             match user_infos.email_verified {
@@ -322,17 +483,25 @@ async fn _password_login(
     conn: &DbConn,
     ip: &ClientIp,
     client_version: &Option<ClientVersion>,
+    limiter: &dyn RateLimiter,
 ) -> JsonResult {
     // Validate scope
     AuthMethod::Password.check_scope(data.scope.as_ref())?;
 
-    // Ratelimit the login
-    crate::ratelimit::check_limit_login(&ip.ip)?;
+    // MED-03-C: rate limit via injected limiter (testable, no global dep)
+    limiter.check_login(&ip.ip).await?;
+
+    // TASK-SEC-HIGH-04-A: Per-account rate limit (independent of per-IP limit).
+    // We run this before DB lookup so even non-existent-user attacks are rate-limited per address.
+    let username = data.username.as_ref().unwrap().trim();
+    crate::ratelimit::check_limit_login_account(username).await?;
+
+    // TASK-SEC-HIGH-04-B: Credential stuffing detection — track unique source IPs per account.
+    crate::ratelimit::detect_credential_stuffing(username, &ip.ip);
 
     // Get the user
-    let username = data.username.as_ref().unwrap().trim();
     let Some(mut user) = User::find_by_mail(username, conn).await else {
-        err!("Username or password is incorrect. Try again", format!("IP: {}. Username: {username}.", ip.ip))
+        err_unauthorized!("Username or password is incorrect. Try again", format!("IP: {}. Username: {username}.", ip.ip))
     };
 
     // Set the user_id here to be passed back used for event logging.
@@ -472,11 +641,13 @@ async fn authenticated_response(
 
     let master_password_policy = master_password_policy(user, conn).await;
 
+    let access_token = auth_tokens.access_token()?;
+    let refresh_token = auth_tokens.refresh_token()?;
     let mut result = json!({
-        "access_token": auth_tokens.access_token(),
+        "access_token": access_token,
         "expires_in": auth_tokens.expires_in(),
         "token_type": "Bearer",
-        "refresh_token": auth_tokens.refresh_token(),
+        "refresh_token": refresh_token,
         "PrivateKey": user.private_key,
         "Kdf": user.client_kdf_type,
         "KdfIterations": user.client_kdf_iter,
@@ -504,9 +675,15 @@ async fn authenticated_response(
     Ok(Json(result))
 }
 
-async fn _api_key_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbConn, ip: &ClientIp) -> JsonResult {
-    // Ratelimit the login
-    crate::ratelimit::check_limit_login(&ip.ip)?;
+async fn _api_key_login(
+    data: ConnectData,
+    user_id: &mut Option<UserId>,
+    conn: &DbConn,
+    ip: &ClientIp,
+    limiter: &dyn RateLimiter,
+) -> JsonResult {
+    // MED-03-C: rate limit via injected limiter (testable, no global dep)
+    limiter.check_login(&ip.ip).await?;
 
     // Validate scope
     match data.scope.as_ref() {
@@ -591,8 +768,9 @@ async fn _user_api_key_login(
 
     // Note: No refresh_token is returned. The CLI just repeats the
     // client_credentials login flow when the existing token expires.
+    let access_token = access_claims.token()?;
     let result = json!({
-        "access_token": access_claims.token(),
+        "access_token": access_token,
         "expires_in": access_claims.expires_in(),
         "token_type": "Bearer",
         "Key": user.akey,
@@ -613,21 +791,21 @@ async fn _organization_api_key_login(data: ConnectData, conn: &DbConn, ip: &Clie
     // Get the org via the client_id
     let client_id = data.client_id.as_ref().unwrap();
     let Some(org_id) = client_id.strip_prefix("organization.") else {
-        err!("Malformed client_id", format!("IP: {}.", ip.ip))
+        err_validation!("Malformed client_id", format!("IP: {}.", ip.ip))
     };
     let org_id: OrganizationId = org_id.to_string().into();
     let Some(org_api_key) = OrganizationApiKey::find_by_org_uuid(&org_id, conn).await else {
-        err!("Invalid client_id", format!("IP: {}.", ip.ip))
+        err_not_found!("Invalid client_id", format!("IP: {}.", ip.ip))
     };
 
     // Check API key.
     let client_secret = data.client_secret.as_ref().unwrap();
     if !org_api_key.check_valid_api_key(client_secret) {
-        err!("Incorrect client_secret", format!("IP: {}. Organization: {}.", ip.ip, org_api_key.org_uuid))
+        err_unauthorized!("Incorrect client_secret", format!("IP: {}. Organization: {}.", ip.ip, org_api_key.org_uuid))
     }
 
     let claim = generate_organization_api_key_login_claims(org_api_key.uuid, org_api_key.org_uuid);
-    let access_token = auth::encode_jwt(&claim);
+    let access_token = auth::encode_jwt(&claim)?;
 
     Ok(Json(json!({
         "access_token": access_token,
@@ -914,7 +1092,7 @@ async fn register_verification_email(
     let should_send_mail = CONFIG.mail_enabled() && CONFIG.signups_verify();
 
     let token_claims = auth::generate_register_verify_claims(data.email.clone(), data.name.clone(), should_send_mail);
-    let token = auth::encode_jwt(&token_claims);
+    let token = auth::encode_jwt(&token_claims)?;
 
     if should_send_mail {
         let user = User::find_by_mail(&data.email, &conn).await;
@@ -1011,7 +1189,7 @@ fn _check_is_some<T>(value: &Option<T>, msg: &str) -> EmptyResult {
 #[get("/sso/prevalidate")]
 fn prevalidate() -> JsonResult {
     if CONFIG.sso_enabled() {
-        let sso_token = sso::encode_ssotoken_claims();
+        let sso_token = sso::encode_ssotoken_claims()?;
         Ok(Json(json!({
             "token": sso_token,
         })))
@@ -1062,7 +1240,7 @@ async fn oidcsignin_redirect(
     conn: &DbConn,
 ) -> ApiResult<Redirect> {
     let state = sso::decode_state(&base64_state)?;
-    let code = sso::encode_code_claims(wrapper(state.clone()));
+    let code = sso::encode_code_claims(wrapper(state.clone()))?;
 
     let nonce = match SsoNonce::find(&state, conn).await {
         Some(n) => n,

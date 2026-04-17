@@ -1,0 +1,12 @@
+apiVersion: v2
+name: vaultwarden
+description: A Helm chart for deploying Vaultwarden with High Availability, PostgreSQL Read Replicas, and Redis Pub/Sub support.
+
+# A chart can be either an 'application' or a 'library' chart.
+type: application
+
+# This is the chart version.
+version: 0.1.0
+
+# This is the version number of the application being deployed.
+appVersion: "2.0-beta"

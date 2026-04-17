@@ -1,4 +1,7 @@
+pub mod access_control;
 pub mod accounts;
+pub mod audit;
+pub mod compliance;
 mod ciphers;
 mod emergency_access;
 mod events;
@@ -7,6 +10,10 @@ mod organizations;
 mod public;
 mod sends;
 pub mod two_factor;
+pub mod api_keys;
+pub mod webhooks;
+pub mod secrets;
+pub mod pam;
 
 pub use accounts::purge_auth_requests;
 pub use ciphers::{purge_trashed_ciphers, CipherData, CipherSyncData, CipherSyncType};
@@ -22,6 +29,8 @@ pub fn routes() -> Vec<Route> {
 
     let mut routes = Vec::new();
     routes.append(&mut accounts::routes());
+    routes.append(&mut audit::routes());
+    routes.append(&mut access_control::routes());
     routes.append(&mut ciphers::routes());
     routes.append(&mut emergency_access::routes());
     routes.append(&mut events::routes());
@@ -30,6 +39,10 @@ pub fn routes() -> Vec<Route> {
     routes.append(&mut two_factor::routes());
     routes.append(&mut sends::routes());
     routes.append(&mut public::routes());
+    routes.append(&mut api_keys::routes());
+    routes.append(&mut webhooks::routes());
+    routes.append(&mut secrets::routes());
+    routes.append(&mut pam::routes());
     routes.append(&mut eq_domains_routes);
     routes.append(&mut hibp_routes);
     routes.append(&mut meta_routes);

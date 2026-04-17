@@ -114,7 +114,7 @@ struct SyncData {
 }
 
 #[get("/sync?<data..>")]
-async fn sync(data: SyncData, headers: Headers, client_version: Option<ClientVersion>, conn: DbConn) -> JsonResult {
+async fn sync(data: SyncData, headers: Headers, client_version: Option<ClientVersion>, conn: crate::db::DbReadConn) -> JsonResult {
     let user_json = headers.user.to_json(&conn).await;
 
     // Get all ciphers which are visible by the user
@@ -194,13 +194,19 @@ async fn get_ciphers(headers: Headers, conn: DbConn) -> JsonResult {
 }
 
 #[get("/ciphers/<cipher_id>")]
-async fn get_cipher(cipher_id: CipherId, headers: Headers, conn: DbConn) -> JsonResult {
+async fn get_cipher(cipher_id: CipherId, headers: Headers, mut conn: DbConn) -> JsonResult {
     let Some(cipher) = Cipher::find_by_uuid(&cipher_id, &conn).await else {
         err!("Cipher doesn't exist")
     };
 
     if !cipher.is_accessible_to_user(&headers.user.uuid, &conn).await {
         err!("Cipher is not owned by user")
+    }
+
+    if cipher.is_privileged && CONFIG.pam_enabled() {
+        if crate::db::models::pam::Checkout::find_active_for_resource(&headers.user.uuid, &cipher_id, &mut conn).await.is_none() {
+            err!("Access Denied: Privileged cipher requires an active Checkout session.");
+        }
     }
 
     Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, &conn).await?))
@@ -340,6 +346,15 @@ async fn post_ciphers(data: Json<CipherData>, headers: Headers, conn: DbConn, nt
 
     let mut cipher = Cipher::new(data.r#type, data.name.clone());
     update_cipher_from_data(&mut cipher, data, &headers, None, &conn, &nt, UpdateType::SyncCipherCreate).await?;
+
+    if let Some(org_uuid) = &cipher.organization_uuid {
+        // TASK-008-011: Fire-and-forget webhook event dispatch
+        crate::webhook_delivery::deliver_event("cipher.created", org_uuid, json!({
+            "type": "cipher.created",
+            "cipherId": cipher.uuid,
+            "organizationId": org_uuid
+        }));
+    }
 
     Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, &conn).await?))
 }
@@ -1126,6 +1141,24 @@ struct UploadData<'f> {
     data: TempFile<'f>,
 }
 
+/// TASK-001-015: Validate storage region against SOL-001 data residency configuration
+fn validate_storage_region() -> Result<(), crate::error::Error> {
+    if CONFIG.data_residency_enforce() {
+        let configured_region = CONFIG.data_residency_region();
+        if !configured_region.is_empty() {
+            let storage_path = CONFIG.attachments_folder();
+            // In a real S3 integration, this would check the S3 client's region config.
+            if storage_path.starts_with("s3://") {
+                let s3_region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+                if !s3_region.eq_ignore_ascii_case(&configured_region) {
+                    err!("Data residency violation: Storage endpoint region does not match configured DATA_RESIDENCY_REGION");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Saves the data content of an attachment to a file. This is common code
 /// shared between the v2 and legacy attachment APIs.
 ///
@@ -1142,6 +1175,9 @@ async fn save_attachment(
     conn: DbConn,
     nt: Notify<'_>,
 ) -> Result<(Cipher, DbConn), crate::error::Error> {
+    // TASK-001-015: Check data residency enforcement before accepting upload
+    validate_storage_region()?;
+
     let data = data.into_inner();
 
     let Some(size) = data.data.len().to_i64() else {

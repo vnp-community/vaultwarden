@@ -5,6 +5,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 use crate::api::admin::FAKE_ADMIN_UUID;
+use crate::tenant::TenantContext;
 use crate::{
     api::{
         core::{accept_org_invite, log_event, two_factor, CipherSyncData, CipherSyncType},
@@ -184,7 +185,12 @@ struct BulkMembershipIds {
 }
 
 #[post("/organizations", data = "<data>")]
-async fn create_organization(headers: Headers, data: Json<OrgData>, conn: DbConn) -> JsonResult {
+async fn create_organization(
+    headers: Headers,
+    data: Json<OrgData>,
+    ctx: TenantContext,
+    mut conn: DbConn,
+) -> JsonResult {
     if !CONFIG.is_org_creation_allowed(&headers.user.email) {
         err!("User not allowed to create organizations")
     }
@@ -192,6 +198,13 @@ async fn create_organization(headers: Headers, data: Json<OrgData>, conn: DbConn
         err!(
             "You may not create an organization. You belong to an organization which has a policy that prohibits you from being a member of any other organization."
         )
+    }
+
+    // TASK-011-010: Org quota check
+    if let TenantContext::Tenant(ref tid) = ctx {
+        if let Err(msg) = crate::tenant::check_org_quota(tid, &mut conn).await {
+            err!(msg)
+        }
     }
 
     let data: OrgData = data.into_inner();
@@ -202,7 +215,11 @@ async fn create_organization(headers: Headers, data: Json<OrgData>, conn: DbConn
         (None, None)
     };
 
-    let org = Organization::new(data.name, &data.billing_email, private_key, public_key);
+    let mut org = Organization::new(data.name, &data.billing_email, private_key, public_key);
+    // Assign the org to the current tenant
+    if let TenantContext::Tenant(ref tid) = ctx {
+        org.tenant_uuid = tid.clone();
+    }
     let mut member = Membership::new(headers.user.uuid, org.uuid.clone(), None);
     let collection = Collection::new(org.uuid.clone(), data.collection_name, None);
 
@@ -276,11 +293,12 @@ async fn leave_organization(org_id: OrganizationId, headers: Headers, conn: DbCo
 }
 
 #[get("/organizations/<org_id>")]
-async fn get_organization(org_id: OrganizationId, headers: OwnerHeaders, conn: DbConn) -> JsonResult {
+async fn get_organization(org_id: OrganizationId, headers: OwnerHeaders, ctx: TenantContext, conn: DbConn) -> JsonResult {
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
-    match Organization::find_by_uuid(&org_id, &conn).await {
+    // TASK-011-010: Use ctx-aware lookup to prevent cross-tenant org access
+    match Organization::find_by_uuid_ctx(&org_id, &ctx, &conn).await {
         Some(organization) => Ok(Json(organization.to_json())),
         None => err!("Can't find organization details"),
     }

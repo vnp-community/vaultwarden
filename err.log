@@ -1,0 +1,146 @@
+    Blocking waiting for file lock on build directory
+    Checking vaultwarden v1.0.0 (/Users/binhnt/Work/blockchain/vaultwarden)
+error: unnecessary qualification
+   --> src/api/notifications.rs:386:12
+    |
+386 |         if crate::CONFIG.redis_enabled() {
+    |            ^^^^^^^^^^^^^
+    |
+    = note: requested on the command line with `-D unused-qualifications`
+help: remove the unnecessary path segments
+    |
+386 -         if crate::CONFIG.redis_enabled() {
+386 +         if CONFIG.redis_enabled() {
+    |
+
+error: unnecessary qualification
+   --> src/api/notifications.rs:609:12
+    |
+609 |         if crate::CONFIG.redis_enabled() {
+    |            ^^^^^^^^^^^^^
+    |
+help: remove the unnecessary path segments
+    |
+609 -         if crate::CONFIG.redis_enabled() {
+609 +         if CONFIG.redis_enabled() {
+    |
+
+error: unnecessary qualification
+   --> src/api/notifications.rs:742:9
+    |
+742 |     if !crate::CONFIG.redis_enabled() {
+    |         ^^^^^^^^^^^^^
+    |
+help: remove the unnecessary path segments
+    |
+742 -     if !crate::CONFIG.redis_enabled() {
+742 +     if !CONFIG.redis_enabled() {
+    |
+
+error: unnecessary qualification
+   --> src/api/notifications.rs:748:52
+    |
+748 |             let client = match redis::Client::open(crate::CONFIG.redis_url()) {
+    |                                                    ^^^^^^^^^^^^^
+    |
+help: remove the unnecessary path segments
+    |
+748 -             let client = match redis::Client::open(crate::CONFIG.redis_url()) {
+748 +             let client = match redis::Client::open(CONFIG.redis_url()) {
+    |
+
+error: unnecessary qualification
+   --> src/api/notifications.rs:752:40
+    |
+752 |                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    |                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+help: remove the unnecessary path segments
+    |
+752 -                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+752 +                     tokio::time::sleep(Duration::from_secs(5)).await;
+    |
+
+error: unnecessary qualification
+   --> src/api/notifications.rs:761:40
+    |
+761 |                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    |                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+help: remove the unnecessary path segments
+    |
+761 -                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+761 +                     tokio::time::sleep(Duration::from_secs(5)).await;
+    |
+
+error: unnecessary qualification
+   --> src/api/notifications.rs:768:36
+    |
+768 |                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+help: remove the unnecessary path segments
+    |
+768 -                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+768 +                 tokio::time::sleep(Duration::from_secs(5)).await;
+    |
+
+error: unnecessary qualification
+   --> src/api/notifications.rs:781:61
+    |
+781 | ...                   WS_USERS.send_update_local(&crate::db::models::UserId::from(user_uuid), &data).await;
+    |                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+help: remove the unnecessary path segments
+    |
+781 -                                 WS_USERS.send_update_local(&crate::db::models::UserId::from(user_uuid), &data).await;
+781 +                                 WS_USERS.send_update_local(&UserId::from(user_uuid), &data).await;
+    |
+
+error: unnecessary qualification
+   --> src/api/notifications.rs:792:32
+    |
+792 |             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+help: remove the unnecessary path segments
+    |
+792 -             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+792 +             tokio::time::sleep(Duration::from_secs(5)).await;
+    |
+
+error: non-binding let on a type that has a destructor
+   --> src/api/notifications.rs:392:17
+    |
+392 |                 let _ = crate::cache::CACHE.publish("vw_ws_update", &payload).await;
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `-D let-underscore-drop` implied by `-D let-underscore`
+    = help: to override `-D let-underscore` add `#[allow(let_underscore_drop)]`
+help: consider binding to an unused variable to avoid immediately dropping the value
+    |
+392 |                 let _unused = crate::cache::CACHE.publish("vw_ws_update", &payload).await;
+    |                      ++++++
+help: consider immediately dropping the value
+    |
+392 -                 let _ = crate::cache::CACHE.publish("vw_ws_update", &payload).await;
+392 +                 drop(crate::cache::CACHE.publish("vw_ws_update", &payload).await);
+    |
+
+error: non-binding let on a type that has a destructor
+   --> src/api/notifications.rs:615:17
+    |
+615 |                 let _ = crate::cache::CACHE.publish("vw_ws_update", &payload).await;
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+help: consider binding to an unused variable to avoid immediately dropping the value
+    |
+615 |                 let _unused = crate::cache::CACHE.publish("vw_ws_update", &payload).await;
+    |                      ++++++
+help: consider immediately dropping the value
+    |
+615 -                 let _ = crate::cache::CACHE.publish("vw_ws_update", &payload).await;
+615 +                 drop(crate::cache::CACHE.publish("vw_ws_update", &payload).await);
+    |
+
+error: could not compile `vaultwarden` (bin "vaultwarden") due to 11 previous errors

@@ -29,6 +29,7 @@ pub struct Organization {
     pub billing_email: String,
     pub private_key: Option<String>,
     pub public_key: Option<String>,
+    pub tenant_uuid: String,
 }
 
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
@@ -48,6 +49,7 @@ pub struct Membership {
     pub atype: i32,
     pub reset_password_key: Option<String>,
     pub external_id: Option<String>,
+    pub custom_role_uuid: Option<String>,
 }
 
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
@@ -180,6 +182,7 @@ impl Organization {
             billing_email,
             private_key,
             public_key,
+            tenant_uuid: CONFIG.tenant_default_uuid(),
         }
     }
     // https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Api/AdminConsole/Models/Response/Organizations/OrganizationResponseModel.cs
@@ -254,6 +257,7 @@ impl Membership {
             atype: MembershipType::User as i32,
             reset_password_key: None,
             external_id: None,
+            custom_role_uuid: None,
         }
     }
 
@@ -289,6 +293,14 @@ impl Membership {
                 Some(external_id) if !external_id.is_empty() => Some(external_id),
                 _ => None,
             };
+            return true;
+        }
+        false
+    }
+
+    pub fn set_custom_role(&mut self, custom_role_uuid: Option<String>) -> bool {
+        if self.custom_role_uuid != custom_role_uuid {
+            self.custom_role_uuid = custom_role_uuid;
             return true;
         }
         false
@@ -441,6 +453,54 @@ impl Organization {
                 .load::<Self>(conn)
                 .expect("Error loading user orgs")
         }}
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // TASK-011-008: Tenant-aware (_ctx) query variants — SOL-011 Multi-Tenancy
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Get all organizations scoped to the current tenant context.
+    pub async fn get_all_ctx(ctx: &crate::tenant::TenantContext, conn: &DbConn) -> Vec<Self> {
+        use crate::tenant::TenantContext;
+        match ctx {
+            TenantContext::SingleInstance | TenantContext::SystemAdmin => {
+                db_run! { conn: {
+                    organizations::table
+                        .load::<Self>(conn)
+                        .expect("Error loading organizations")
+                }}
+            }
+            TenantContext::Tenant(tenant_uuid) => {
+                let tid = tenant_uuid.clone();
+                db_run! { conn: {
+                    organizations::table
+                        .filter(organizations::tenant_uuid.eq(tid))
+                        .load::<Self>(conn)
+                        .expect("Error loading tenant organizations")
+                }}
+            }
+        }
+    }
+
+    /// Find an organization by UUID, validating it belongs to the tenant context.
+    /// Returns None if the org exists but belongs to a different tenant (prevents cross-tenant leakage).
+    pub async fn find_by_uuid_ctx(
+        uuid: &OrganizationId,
+        ctx: &crate::tenant::TenantContext,
+        conn: &DbConn,
+    ) -> Option<Self> {
+        use crate::tenant::TenantContext;
+        let org = Self::find_by_uuid(uuid, conn).await?;
+        match ctx {
+            TenantContext::SingleInstance | TenantContext::SystemAdmin => Some(org),
+            TenantContext::Tenant(tenant_uuid) => {
+                if org.tenant_uuid == *tenant_uuid {
+                    Some(org)
+                } else {
+                    None // Cross-tenant access denied
+                }
+            }
+        }
     }
 }
 
@@ -660,6 +720,7 @@ impl Membership {
             "permissions": permissions,
 
             "ssoBound": false, // Not supported
+            "customRole": self.custom_role_uuid,
             "managedByOrganization": false, // This key is obsolete replaced by claimedByOrganization
             "claimedByOrganization": false, // Means not managed via the Members UI, like SSO
             "usesKeyConnector": false, // Not supported

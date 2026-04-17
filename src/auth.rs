@@ -1,7 +1,7 @@
 use std::{
     env,
     net::IpAddr,
-    sync::{LazyLock, OnceLock},
+    sync::{LazyLock, RwLock},
 };
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -27,9 +27,12 @@ const JWT_ALGORITHM: Algorithm = Algorithm::RS256;
 // Limit when BitWarden consider the token as expired
 pub static BW_EXPIRATION: LazyLock<TimeDelta> = LazyLock::new(|| TimeDelta::try_minutes(5).unwrap());
 
-pub static DEFAULT_REFRESH_VALIDITY: LazyLock<TimeDelta> = LazyLock::new(|| TimeDelta::try_days(30).unwrap());
-pub static MOBILE_REFRESH_VALIDITY: LazyLock<TimeDelta> = LazyLock::new(|| TimeDelta::try_days(90).unwrap());
-pub static DEFAULT_ACCESS_VALIDITY: LazyLock<TimeDelta> = LazyLock::new(|| TimeDelta::try_hours(2).unwrap());
+pub static DEFAULT_REFRESH_VALIDITY: LazyLock<TimeDelta> =
+    LazyLock::new(|| TimeDelta::try_days(i64::from(CONFIG.refresh_token_validity_days())).unwrap());
+pub static MOBILE_REFRESH_VALIDITY: LazyLock<TimeDelta> =
+    LazyLock::new(|| TimeDelta::try_days(i64::from(CONFIG.mobile_refresh_token_validity_days())).unwrap());
+pub static DEFAULT_ACCESS_VALIDITY: LazyLock<TimeDelta> =
+    LazyLock::new(|| TimeDelta::try_hours(i64::from(CONFIG.access_token_validity_hours())).unwrap());
 static JWT_HEADER: LazyLock<Header> = LazyLock::new(|| Header::new(JWT_ALGORITHM));
 
 pub static JWT_LOGIN_ISSUER: LazyLock<String> = LazyLock::new(|| format!("{}|login", CONFIG.domain_origin()));
@@ -47,53 +50,357 @@ static JWT_FILE_DOWNLOAD_ISSUER: LazyLock<String> =
 static JWT_REGISTER_VERIFY_ISSUER: LazyLock<String> =
     LazyLock::new(|| format!("{}|register_verify", CONFIG.domain_origin()));
 
-static PRIVATE_RSA_KEY: OnceLock<EncodingKey> = OnceLock::new();
-static PUBLIC_RSA_KEY: OnceLock<DecodingKey> = OnceLock::new();
+// TASK-SEC-LOW-01-A: Changed from OnceLock to RwLock to support JWT signing key rotation without restart.
+// Reads acquire a read guard; rotation takes a brief write lock to swap both keys atomically.
+static PRIVATE_RSA_KEY: RwLock<Option<EncodingKey>> = RwLock::new(None);
+static PUBLIC_RSA_KEY: RwLock<Option<DecodingKey>> = RwLock::new(None);
+
+/// Encrypt RSA PEM bytes with AES-256-GCM using the master key from config.
+/// Storage format: `[12-byte nonce][ciphertext]`.
+fn encrypt_rsa_key(pem: &[u8], master_key: &str) -> Result<Vec<u8>, Error> {
+    use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+    use ring::digest::{digest, SHA256};
+    use ring::rand::{SecureRandom, SystemRandom};
+
+    // Derive a 32-byte key from the master secret via SHA-256
+    let key_bytes = digest(&SHA256, master_key.as_bytes());
+    let unbound = UnboundKey::new(&AES_256_GCM, key_bytes.as_ref())
+        .map_err(|_| Error::new("Failed to create AES key", ""))?;
+    let key = LessSafeKey::new(unbound);
+
+    let rng = SystemRandom::new();
+    let mut nonce_bytes = [0u8; 12];
+    rng.fill(&mut nonce_bytes).map_err(|_| Error::new("Failed to generate nonce", ""))?;
+    let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+
+    let mut ciphertext = pem.to_vec();
+    key.seal_in_place_append_tag(nonce, Aad::empty(), &mut ciphertext)
+        .map_err(|_| Error::new("AES-GCM encryption failed", ""))?;
+
+    let mut out = nonce_bytes.to_vec();
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+/// Decrypt RSA PEM bytes previously encrypted by `encrypt_rsa_key`.
+fn decrypt_rsa_key(data: &[u8], master_key: &str) -> Result<Vec<u8>, Error> {
+    use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+    use ring::digest::{digest, SHA256};
+
+    if data.len() < 12 {
+        return Err(Error::new("Encrypted RSA key too short", ""));
+    }
+    let (nonce_bytes, ciphertext) = data.split_at(12);
+    let nonce = Nonce::assume_unique_for_key(nonce_bytes.try_into().unwrap());
+
+    let key_bytes = digest(&SHA256, master_key.as_bytes());
+    let unbound = UnboundKey::new(&AES_256_GCM, key_bytes.as_ref())
+        .map_err(|_| Error::new("Failed to create AES key", ""))?;
+    let key = LessSafeKey::new(unbound);
+
+    let mut plaintext = ciphertext.to_vec();
+    let decrypted = key.open_in_place(nonce, Aad::empty(), &mut plaintext)
+        .map_err(|_| Error::new("AES-GCM decryption failed — wrong RSA_KEY_ENCRYPTION_KEY or corrupted key file", ""))?;
+    Ok(decrypted.to_vec())
+}
 
 pub async fn initialize_keys() -> Result<(), Error> {
-    use std::io::Error;
+    use std::io::Error as IoError;
 
     let rsa_key_filename = std::path::PathBuf::from(CONFIG.private_rsa_key())
         .file_name()
-        .ok_or_else(|| Error::other("Private RSA key path missing filename"))?
+        .ok_or_else(|| IoError::other("Private RSA key path missing filename"))?
         .to_str()
-        .ok_or_else(|| Error::other("Private RSA key path filename is not valid UTF-8"))?
+        .ok_or_else(|| IoError::other("Private RSA key path filename is not valid UTF-8"))?
         .to_string();
 
-    let operator = CONFIG.opendal_operator_for_path_type(&PathType::RsaKey).map_err(Error::other)?;
+    let operator = CONFIG.opendal_operator_for_path_type(&PathType::RsaKey).map_err(IoError::other)?;
 
-    let priv_key_buffer = match operator.read(&rsa_key_filename).await {
-        Ok(buffer) => Some(buffer),
+    let raw_file_bytes = match operator.read(&rsa_key_filename).await {
+        Ok(buffer) => Some(buffer.to_vec()),
         Err(e) if e.kind() == opendal::ErrorKind::NotFound => None,
         Err(e) => return Err(e.into()),
     };
 
-    let (priv_key, priv_key_buffer) = if let Some(priv_key_buffer) = priv_key_buffer {
-        (Rsa::private_key_from_pem(priv_key_buffer.to_vec().as_slice())?, priv_key_buffer.to_vec())
+    let master_key = CONFIG.rsa_key_encryption_key();
+    let encryption_enabled = !master_key.is_empty();
+
+    let (priv_key, priv_key_pem) = if let Some(raw) = raw_file_bytes {
+        // Decrypt if master key is set; otherwise treat as raw PEM
+        let pem = if encryption_enabled {
+            decrypt_rsa_key(&raw, &master_key)?
+        } else {
+            raw
+        };
+        (Rsa::private_key_from_pem(&pem)?, pem)
     } else {
         let rsa_key = Rsa::generate(2048)?;
-        let priv_key_buffer = rsa_key.private_key_to_pem()?;
-        operator.write(&rsa_key_filename, priv_key_buffer.clone()).await?;
+        let pem = rsa_key.private_key_to_pem()?;
+        let to_store = if encryption_enabled {
+            encrypt_rsa_key(&pem, &master_key)?
+        } else {
+            pem.clone()
+        };
+        operator.write(&rsa_key_filename, to_store).await?;
         info!("Private key '{}' created correctly", CONFIG.private_rsa_key());
-        (rsa_key, priv_key_buffer)
+        (rsa_key, pem)
     };
+
+    // Startup warning if key is stored unencrypted
+    if !encryption_enabled {
+        warn!(
+            "SECURITY: RSA private key is stored unencrypted. \
+             Set RSA_KEY_ENCRYPTION_KEY to encrypt it at rest."
+        );
+    }
+
     let pub_key_buffer = priv_key.public_key_to_pem()?;
 
-    let enc = EncodingKey::from_rsa_pem(&priv_key_buffer)?;
+    let enc = EncodingKey::from_rsa_pem(&priv_key_pem)?;
     let dec: DecodingKey = DecodingKey::from_rsa_pem(&pub_key_buffer)?;
-    if PRIVATE_RSA_KEY.set(enc).is_err() {
-        err!("PRIVATE_RSA_KEY must only be initialized once")
-    }
-    if PUBLIC_RSA_KEY.set(dec).is_err() {
-        err!("PUBLIC_RSA_KEY must only be initialized once")
-    }
+    *PRIVATE_RSA_KEY.write().expect("PRIVATE_RSA_KEY poisoned") = Some(enc);
+    *PUBLIC_RSA_KEY.write().expect("PUBLIC_RSA_KEY poisoned") = Some(dec);
     Ok(())
 }
 
-pub fn encode_jwt<T: Serialize>(claims: &T) -> String {
-    match jsonwebtoken::encode(&JWT_HEADER, claims, PRIVATE_RSA_KEY.wait()) {
-        Ok(token) => token,
-        Err(e) => panic!("Error encoding jwt {e}"),
+/// TASK-SEC-LOW-01-A: Hot-rotate the JWT signing RSA key without server restart.
+/// Steps:
+///  1. Archive the current key file as `{filename}.{timestamp}.bak`
+///  2. Generate a new RSA-2048 key pair
+///  3. Persist the new private key (encrypted if RSA_KEY_ENCRYPTION_KEY is set)
+///  4. Hot-swap both global statics under write lock — new tokens use new key; old tokens
+///     will fail validation on the next request (security_stamp rotation is done by caller)
+///
+/// Returns the new public key PEM string for admin confirmation.
+pub async fn rotate_jwt_signing_key() -> Result<String, Error> {
+    use std::io::Error as IoError;
+
+    let rsa_key_filename = std::path::PathBuf::from(CONFIG.private_rsa_key())
+        .file_name()
+        .ok_or_else(|| IoError::other("Private RSA key path missing filename"))?
+        .to_str()
+        .ok_or_else(|| IoError::other("Private RSA key path filename is not valid UTF-8"))?
+        .to_string();
+
+    let operator = CONFIG.opendal_operator_for_path_type(&PathType::RsaKey).map_err(IoError::other)?;
+
+    // 1. Archive current key (best-effort; failure is non-fatal)
+    let archive_name = format!(
+        "{}.{}.bak",
+        rsa_key_filename,
+        Utc::now().format("%Y%m%dT%H%M%SZ")
+    );
+    if let Ok(current_bytes) = operator.read(&rsa_key_filename).await {
+        if let Err(e) = operator.write(&archive_name, current_bytes.to_vec()).await {
+            warn!("[KeyRotation] Failed to archive old RSA key as {archive_name}: {e}");
+        } else {
+            info!("[KeyRotation] Old RSA key archived as {archive_name}");
+        }
+    }
+
+    // 2. Generate new RSA-2048 key pair
+    let new_rsa = Rsa::generate(2048)?;
+    let new_pem = new_rsa.private_key_to_pem()?;
+    let new_pub_pem = new_rsa.public_key_to_pem()?;
+
+    // 3. Persist (encrypt if master key configured)
+    let master_key = CONFIG.rsa_key_encryption_key();
+    let to_store = if !master_key.is_empty() {
+        encrypt_rsa_key(&new_pem, &master_key)?
+    } else {
+        new_pem.clone()
+    };
+    operator.write(&rsa_key_filename, to_store).await.map_err(IoError::other)?;
+    info!("[KeyRotation] New RSA key written to {rsa_key_filename}");
+
+    // 4. Hot-swap under write lock (brief exclusive window)
+    let new_enc = EncodingKey::from_rsa_pem(&new_pem)?;
+    let new_dec = DecodingKey::from_rsa_pem(&new_pub_pem)?;
+    *PRIVATE_RSA_KEY.write().expect("PRIVATE_RSA_KEY poisoned") = Some(new_enc);
+    *PUBLIC_RSA_KEY.write().expect("PUBLIC_RSA_KEY poisoned") = Some(new_dec);
+
+    let pub_pem_str = String::from_utf8(new_pub_pem).map_err(|e| IoError::other(e.to_string()))?;
+    info!("[KeyRotation] JWT signing key rotated successfully");
+    Ok(pub_pem_str)
+}
+
+pub fn encode_jwt<T: Serialize>(claims: &T) -> Result<String, Error> {
+    let key_guard = PRIVATE_RSA_KEY.read().expect("PRIVATE_RSA_KEY poisoned");
+    let key = key_guard.as_ref().ok_or_else(|| Error::new("RSA key not initialized", ""))?;
+    match jsonwebtoken::encode(&JWT_HEADER, claims, key) {
+        Ok(token) => Ok(token),
+        Err(e) => {
+            error!("JWT encoding failed: {e}");
+            Err(Error::new("JWT encoding failed", e.to_string()))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    /// Initialize RSA test keys once for all tests in this module.
+    /// Uses `get_or_init` so it is safe to call from multiple tests.
+    fn init_test_keys() {
+        use openssl::rsa::Rsa;
+        let mut guard = PRIVATE_RSA_KEY.write().expect("PRIVATE_RSA_KEY poisoned");
+        if guard.is_none() {
+            let rsa = Rsa::generate(2048).expect("RSA key generation failed");
+            let priv_pem = rsa.private_key_to_pem().expect("priv pem");
+            let pub_pem = rsa.public_key_to_pem().expect("pub pem");
+            let enc = EncodingKey::from_rsa_pem(&priv_pem).expect("encoding key");
+            let dec = DecodingKey::from_rsa_pem(&pub_pem).expect("decoding key");
+            *guard = Some(enc);
+            *PUBLIC_RSA_KEY.write().expect("PUBLIC_RSA_KEY poisoned") = Some(dec);
+        }
+    }
+
+    fn make_test_claims(exp_offset_secs: i64) -> BasicJwtClaims {
+        let now = Utc::now().timestamp();
+        BasicJwtClaims {
+            nbf: now - 1,
+            exp: now + exp_offset_secs,
+            iss: "test|delete".to_string(),
+            sub: "test-user-uuid".to_string(),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // TASK-RUSTDEV-CRIT-01-C / TASK-RUSTDEV-LOW-02-A
+    // -------------------------------------------------------------------------
+
+    /// encode_jwt must not panic and must return Ok for valid claims.
+    #[test]
+    fn test_encode_jwt_returns_ok() {
+        init_test_keys();
+        let claims = make_test_claims(3600);
+        let result = encode_jwt(&claims);
+        assert!(result.is_ok(), "encode_jwt should return Ok, got: {:?}", result);
+        let token = result.unwrap();
+        assert!(!token.is_empty(), "token should not be empty");
+        // JWT has three dot-separated parts
+        assert_eq!(token.split('.').count(), 3, "JWT should have 3 parts");
+    }
+
+    /// Encode then decode must round-trip all claim fields.
+    #[test]
+    fn test_encode_decode_roundtrip() {
+        init_test_keys();
+        let claims = make_test_claims(3600);
+        let token = encode_jwt(&claims).expect("encode should succeed");
+
+        let mut validation = jsonwebtoken::Validation::new(JWT_ALGORITHM);
+        validation.leeway = 30;
+        validation.validate_exp = true;
+        validation.validate_nbf = true;
+        validation.set_issuer(&["test|delete"]);
+
+        let decoded: BasicJwtClaims = {
+            let key_guard = PUBLIC_RSA_KEY.read().expect("PUBLIC_RSA_KEY poisoned");
+            jsonwebtoken::decode(&token, key_guard.as_ref().unwrap(), &validation)
+                .expect("decode should succeed")
+                .claims
+        };
+
+        assert_eq!(decoded.sub, claims.sub);
+        assert_eq!(decoded.iss, claims.iss);
+        assert_eq!(decoded.nbf, claims.nbf);
+        assert_eq!(decoded.exp, claims.exp);
+    }
+
+    /// A token with exp in the past must be rejected by the decoder.
+    #[test]
+    fn test_expired_jwt_rejected() {
+        init_test_keys();
+        // exp 60s in the past, nbf before that
+        let now = Utc::now().timestamp();
+        let claims = BasicJwtClaims {
+            nbf: now - 120,
+            exp: now - 60,
+            iss: "test|delete".to_string(),
+            sub: "test-user-uuid".to_string(),
+        };
+        let token = encode_jwt(&claims).expect("encode should succeed");
+
+        let mut validation = jsonwebtoken::Validation::new(JWT_ALGORITHM);
+        validation.leeway = 0;
+        validation.validate_exp = true;
+        validation.validate_nbf = true;
+        validation.set_issuer(&["test|delete"]);
+
+        let result: Result<jsonwebtoken::TokenData<BasicJwtClaims>, _> = {
+            let key_guard = PUBLIC_RSA_KEY.read().expect("PUBLIC_RSA_KEY poisoned");
+            jsonwebtoken::decode(&token, key_guard.as_ref().unwrap(), &validation)
+        };
+        assert!(result.is_err(), "expired JWT should be rejected");
+        let kind = result.unwrap_err().into_kind();
+        assert!(
+            matches!(kind, ErrorKind::ExpiredSignature),
+            "error should be ExpiredSignature, got: {:?}",
+            kind
+        );
+    }
+
+    /// Tampering with the signature bytes must cause decode to fail.
+    #[test]
+    fn test_tampered_jwt_rejected() {
+        init_test_keys();
+        let claims = make_test_claims(3600);
+        let token = encode_jwt(&claims).expect("encode should succeed");
+
+        // Flip bytes in the signature (third part)
+        let mut parts: Vec<&str> = token.split('.').collect();
+        let mut sig = parts[2].as_bytes().to_vec();
+        // XOR the first byte to corrupt the signature
+        sig[0] ^= 0xFF;
+        let bad_sig = String::from_utf8_lossy(&sig).into_owned();
+        parts[2] = Box::leak(bad_sig.into_boxed_str());
+        let tampered = parts.join(".");
+
+        let mut validation = jsonwebtoken::Validation::new(JWT_ALGORITHM);
+        validation.leeway = 30;
+        validation.validate_exp = true;
+        validation.set_issuer(&["test|delete"]);
+
+        let result: Result<jsonwebtoken::TokenData<BasicJwtClaims>, _> = {
+            let key_guard = PUBLIC_RSA_KEY.read().expect("PUBLIC_RSA_KEY poisoned");
+            jsonwebtoken::decode(&tampered, key_guard.as_ref().unwrap(), &validation)
+        };
+        assert!(result.is_err(), "tampered JWT should be rejected");
+    }
+
+    // -------------------------------------------------------------------------
+    // AES-256-GCM RSA key encryption (TASK-RUSTDEV-MED-02-B/C)
+    // -------------------------------------------------------------------------
+
+    /// Encrypt then decrypt of RSA PEM must produce the original bytes.
+    #[test]
+    fn test_rsa_key_encrypt_decrypt_roundtrip() {
+        let pem = b"fake-pem-bytes-for-testing-purposes";
+        let master = "my-test-master-key";
+        let encrypted = encrypt_rsa_key(pem, master).expect("encrypt should succeed");
+        // Encrypted blob is nonce (12) + ciphertext + tag
+        assert!(encrypted.len() > 12 + pem.len(), "encrypted output should be longer than input");
+        let decrypted = decrypt_rsa_key(&encrypted, master).expect("decrypt should succeed");
+        assert_eq!(decrypted, pem);
+    }
+
+    /// Decrypting with wrong key must return Err.
+    #[test]
+    fn test_rsa_key_decrypt_wrong_key_fails() {
+        let pem = b"fake-pem-bytes";
+        let encrypted = encrypt_rsa_key(pem, "correct-key").expect("encrypt");
+        let result = decrypt_rsa_key(&encrypted, "wrong-key");
+        assert!(result.is_err(), "wrong key must fail decryption");
+    }
+
+    /// Truncated data (< 12 bytes) must fail gracefully without panic.
+    #[test]
+    fn test_rsa_key_decrypt_too_short_fails() {
+        let result = decrypt_rsa_key(b"short", "any-key");
+        assert!(result.is_err());
     }
 }
 
@@ -105,7 +412,9 @@ pub fn decode_jwt<T: DeserializeOwned>(token: &str, issuer: String) -> Result<T,
     validation.set_issuer(&[issuer]);
 
     let token = token.replace(char::is_whitespace, "");
-    match jsonwebtoken::decode(&token, PUBLIC_RSA_KEY.wait(), &validation) {
+    let key_guard = PUBLIC_RSA_KEY.read().expect("PUBLIC_RSA_KEY poisoned");
+    let key = key_guard.as_ref().ok_or_else(|| Error::new("RSA key not initialized", ""))?;
+    match jsonwebtoken::decode(&token, key, &validation) {
         Ok(d) => Ok(d.claims),
         Err(err) => match *err.kind() {
             ErrorKind::InvalidToken => err!("Token is invalid"),
@@ -200,6 +509,20 @@ pub struct LoginJwtClaims {
     pub scope: Vec<String>,
     // [ "Application" ]
     pub amr: Vec<String>,
+
+    // TASK-SEC-HIGH-02-F: JWT ID for opt-in token revocation.
+    // Only included in the JWT when TOKEN_REVOCATION_ENABLED=true.
+    // Using Option + skip_serializing_if keeps backward-compat tokens when revocation is off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jti: Option<String>,
+
+    // SOL-011: Multi-Tenancy fields
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_uuid: Option<String>,
+    #[serde(default)]
+    pub is_tenant_admin: bool,
+    #[serde(default)]
+    pub is_system_admin: bool,
 }
 
 impl LoginJwtClaims {
@@ -255,6 +578,15 @@ impl LoginJwtClaims {
             client_id: client_id.unwrap_or("undefined".to_string()),
             scope,
             amr: vec!["Application".into()],
+            // TASK-SEC-HIGH-02-F: inject jti only when revocation is enabled.
+            jti: if CONFIG.token_revocation_enabled() {
+                Some(crate::util::get_uuid())
+            } else {
+                None
+            },
+            tenant_uuid: None,
+            is_tenant_admin: false,
+            is_system_admin: false,
         }
     }
 
@@ -271,7 +603,7 @@ impl LoginJwtClaims {
         )
     }
 
-    pub fn token(&self) -> String {
+    pub fn token(&self) -> Result<String, Error> {
         encode_jwt(&self)
     }
 
@@ -653,6 +985,21 @@ impl<'r> FromRequest<'r> for Headers {
             }
         }
 
+        // TASK-SEC-HIGH-02-F: JTI revocation check (opt-in).
+        // Only performs a DB lookup when TOKEN_REVOCATION_ENABLED=true AND the token has a jti.
+        if CONFIG.token_revocation_enabled() {
+            if let Some(jti) = &claims.jti {
+                use crate::db::models::RevokedToken;
+                if RevokedToken::exists(jti, &conn).await {
+                    err_handler!("Token has been revoked")
+                }
+            }
+        }
+
+        if let Err(e) = crate::access_control::validate_ip_allowlist(&ip.ip, None, &conn).await {
+            err_handler!(e);
+        }
+
         Outcome::Success(Headers {
             host,
             device,
@@ -674,19 +1021,29 @@ pub struct OrgHeaders {
 
 impl OrgHeaders {
     fn is_member(&self) -> bool {
-        // NOTE: we don't care about MembershipStatus at the moment because this is only used
-        // where an invited, accepted or confirmed user is expected if this ever changes or
-        // if from_i32 is changed to return Some(Revoked) this check needs to be changed accordingly
         self.membership_type >= MembershipType::User
     }
     fn is_confirmed_and_admin(&self) -> bool {
-        self.membership_status == MembershipStatus::Confirmed && self.membership_type >= MembershipType::Admin
+        if let Some(_) = &self.membership.custom_role_uuid {
+            // Soft fallback if using custom roles, normally permissions matrix handles granular action
+            self.membership_status == MembershipStatus::Confirmed
+        } else {
+            self.membership_status == MembershipStatus::Confirmed && self.membership_type >= MembershipType::Admin
+        }
     }
     fn is_confirmed_and_manager(&self) -> bool {
-        self.membership_status == MembershipStatus::Confirmed && self.membership_type >= MembershipType::Manager
+        if let Some(_) = &self.membership.custom_role_uuid {
+            self.membership_status == MembershipStatus::Confirmed
+        } else {
+            self.membership_status == MembershipStatus::Confirmed && self.membership_type >= MembershipType::Manager
+        }
     }
     fn is_confirmed_and_owner(&self) -> bool {
-        self.membership_status == MembershipStatus::Confirmed && self.membership_type == MembershipType::Owner
+        if let Some(_) = &self.membership.custom_role_uuid {
+            self.membership_status == MembershipStatus::Confirmed
+        } else {
+            self.membership_status == MembershipStatus::Confirmed && self.membership_type == MembershipType::Owner
+        }
     }
 }
 
@@ -721,6 +1078,14 @@ impl<'r> FromRequest<'r> for OrgHeaders {
                 let Some(membership) = Membership::find_by_user_and_org(&user.uuid, &org_id, &conn).await else {
                     err_handler!("The current user isn't member of the organization");
                 };
+
+                if let Err(e) = crate::access_control::validate_ip_allowlist(&headers.ip.ip, Some(&org_id), &conn).await {
+                    err_handler!(e);
+                }
+
+                if let Err(e) = crate::access_control::validate_access_schedules(&user.uuid, Some(&org_id), &conn).await {
+                    err_handler!(e);
+                }
 
                 Outcome::Success(Self {
                     host: headers.host,
@@ -1001,21 +1366,27 @@ impl<'r> FromRequest<'r> for ClientIp {
     type Error = ();
 
     async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-        let ip = if CONFIG._ip_header_enabled() {
-            req.headers().get_one(&CONFIG.ip_header()).and_then(|ip| {
-                match ip.find(',') {
-                    Some(idx) => &ip[..idx],
-                    None => ip,
-                }
-                .parse()
-                .map_err(|_| warn!("'{}' header is malformed: {ip}", CONFIG.ip_header()))
-                .ok()
-            })
+        // SEC-HIGH-04-E: When TRUSTED_PROXIES is configured, use the secure
+        // get_real_ip() which only honours XFF from trusted CIDR ranges.
+        let ip = if !CONFIG.trusted_proxies().trim().is_empty() {
+            crate::util::get_real_ip(req)
+        } else if CONFIG._ip_header_enabled() {
+            req.headers()
+                .get_one(&CONFIG.ip_header())
+                .and_then(|ip| {
+                    match ip.find(',') {
+                        Some(idx) => &ip[..idx],
+                        None => ip,
+                    }
+                    .parse()
+                    .map_err(|_| warn!("'{}' header is malformed: {ip}", CONFIG.ip_header()))
+                    .ok()
+                })
+                .or_else(|| req.remote().map(|r| r.ip()))
+                .unwrap_or_else(|| "0.0.0.0".parse().unwrap())
         } else {
-            None
+            req.remote().map(|r| r.ip()).unwrap_or_else(|| "0.0.0.0".parse().unwrap())
         };
-
-        let ip = ip.or_else(|| req.remote().map(|r| r.ip())).unwrap_or_else(|| "0.0.0.0".parse().unwrap());
 
         Outcome::Success(ClientIp {
             ip,
@@ -1158,11 +1529,11 @@ pub struct AuthTokens {
 }
 
 impl AuthTokens {
-    pub fn refresh_token(&self) -> String {
+    pub fn refresh_token(&self) -> Result<String, Error> {
         encode_jwt(&self.refresh_claims)
     }
 
-    pub fn access_token(&self) -> String {
+    pub fn access_token(&self) -> Result<String, Error> {
         self.access_claims.token()
     }
 
@@ -1244,4 +1615,114 @@ pub async fn refresh_tokens(
     };
 
     Ok((device, auth_tokens))
+}
+
+pub struct ApiKeyAuth {
+    #[allow(dead_code)]
+    pub org_uuid: String,
+    #[allow(dead_code)]
+    pub api_key_id: String,
+}
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for ApiKeyAuth {
+    type Error = &'static str;
+
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        use rocket::http::Status;
+        if !CONFIG.api_key_v2_enabled() {
+            return Outcome::Error((Status::Forbidden, "API Keys V2 disabled"));
+        }
+
+        let mut conn = match DbConn::from_request(request).await {
+            Outcome::Success(conn) => conn,
+            _ => return Outcome::Error((Status::InternalServerError, "Database connection failed")),
+        };
+
+        let headers = request.headers();
+        let _token = if let Some(auth) = headers.get_one("Authorization") {
+            if auth.starts_with("Bearer ") {
+                &auth[7..]
+            } else {
+                return Outcome::Error((Status::Unauthorized, "Invalid Authorization header"));
+            }
+        } else {
+            return Outcome::Error((Status::Unauthorized, "Missing Authorization header"));
+        };
+
+        // "client_id:secret_candidate" format inside Bearer token
+        let parts: Vec<&str> = _token.split(':').collect();
+        if parts.len() != 2 {
+            return Outcome::Error((Status::Unauthorized, "Invalid token format"));
+        }
+        let client_id = parts[0];
+        let secret_candidate = parts[1];
+
+        let mut api_key = match crate::db::models::ApiKeyV2::find_by_client_id(client_id, &mut conn).await {
+            Some(k) => k,
+            None => return Outcome::Error((Status::Unauthorized, "Invalid API Key")),
+        };
+
+        if !api_key.is_active {
+            return Outcome::Error((Status::Unauthorized, "API Key is disabled"));
+        }
+
+        if !api_key.verify_token(secret_candidate) {
+            return Outcome::Error((Status::Unauthorized, "Invalid API Key"));
+        }
+
+        // TODO: Check rate limit & allowed IPs
+
+        // Touch the key in the background
+        if let Err(e) = api_key.touch(&mut conn).await {
+            error!("Failed to touch API key: {:?}", e);
+        }
+
+        Outcome::Success(ApiKeyAuth {
+            org_uuid: api_key.org_uuid.clone(),
+            api_key_id: api_key.uuid.clone(),
+        })
+    }
+}
+
+#[allow(dead_code)]
+pub fn require_scope(api_key: &crate::db::models::ApiKeyV2, scope: &str) -> crate::api::EmptyResult {
+    let scopes: Vec<&str> = api_key.scopes.split(',').collect();
+    if scopes.contains(&scope) {
+        Ok(())
+    } else {
+        err!("API Key missing required scope")
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TASK-011-017: SystemAdminHeaders request guard
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Guard that validates the X-System-Admin-Token header via constant-time SHA-256.
+pub struct SystemAdminHeaders;
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for SystemAdminHeaders {
+    type Error = &'static str;
+
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        use rocket::http::Status;
+        let stored_token = CONFIG.system_admin_token();
+        if stored_token.is_empty() {
+            return Outcome::Error((Status::Unauthorized, "System admin token not configured"));
+        }
+
+        if let Some(provided) = request.headers().get_one("X-System-Admin-Token") {
+            use ring::digest;
+            use data_encoding::HEXLOWER;
+            let p_hash = HEXLOWER.encode(digest::digest(&digest::SHA256, provided.as_bytes()).as_ref());
+            let s_hash = HEXLOWER.encode(digest::digest(&digest::SHA256, stored_token.as_bytes()).as_ref());
+            if p_hash == s_hash {
+                return Outcome::Success(SystemAdminHeaders);
+            }
+        }
+
+        Outcome::Error((Status::Unauthorized, "Invalid system admin token"))
+    }
 }

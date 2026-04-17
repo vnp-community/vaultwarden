@@ -49,6 +49,12 @@ pub struct Cipher {
     pub password_history: Option<String>,
     pub deleted_at: Option<NaiveDateTime>,
     pub reprompt: Option<i32>,
+
+    pub is_privileged: bool,
+    pub privileged_config_uuid: Option<String>,
+
+    pub is_secret: bool,
+    pub secret_project: Option<String>,
 }
 
 pub enum RepromptType {
@@ -81,6 +87,10 @@ impl Cipher {
             password_history: None,
             deleted_at: None,
             reprompt: None,
+            is_privileged: false,
+            privileged_config_uuid: None,
+            is_secret: false,
+            secret_project: None,
         }
     }
 

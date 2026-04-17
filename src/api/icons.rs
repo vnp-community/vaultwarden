@@ -120,6 +120,17 @@ async fn icon_internal(domain: &str) -> Cached<(ContentType, Vec<u8>)> {
         );
     }
 
+    // SEC-HIGH-03-C: Block known cloud metadata and special-purpose domains
+    // to prevent icon-proxy SSRF to infrastructure metadata services.
+    if is_blocked_icon_domain(domain) {
+        warn!("Blocked icon domain (SSRF blocklist): {domain}");
+        return Cached::ttl(
+            (ContentType::new("image", "png"), FALLBACK_ICON.to_vec()),
+            CONFIG.icon_cache_negttl(),
+            true,
+        );
+    }
+
     if should_block_address(domain) {
         warn!("Blocked address: {domain}");
         return Cached::ttl(
@@ -171,6 +182,22 @@ fn is_valid_domain(domain: &str) -> bool {
     }
 
     true
+}
+
+/// SEC-HIGH-03-C: Hardcoded blocklist of domains known to be cloud metadata
+/// endpoints or other special-purpose targets that must never be fetched via
+/// the icon proxy, regardless of IP-based checks.
+fn is_blocked_icon_domain(domain: &str) -> bool {
+    const BLOCKED_DOMAINS: &[&str] = &[
+        "localhost",
+        "metadata.google.internal",
+        // AWS/Azure/Alibaba/Oracle cloud metadata IP literals handled by http_client,
+        // but also block the well-known hostnames as an extra layer.
+        "instance-data",
+        "instance-metadata",
+    ];
+    let lower = domain.to_lowercase();
+    BLOCKED_DOMAINS.iter().any(|&blocked| lower == blocked || lower.ends_with(&format!(".{blocked}")))
 }
 
 async fn get_icon(domain: &str) -> Option<(Vec<u8>, String)> {
